@@ -54,5 +54,5 @@ types-PyYAML==6.0.12.20241230
 typing_extensions==4.12.2
 
 # Optional Dependencies
-pdpbox==Available # Partial dependence plots
+pdpbox==0.3.0 # Partial dependence plots
 itables==2.2.2 # Interactive tables
