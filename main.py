@@ -64,13 +64,28 @@ from ui.notifications import notification_manager
 from ui.settings import ui_settings
 from ui.validators import ui_validator
 
+# Utility imports
+from utils import (
+    monitor_performance, 
+    handle_exceptions, 
+    log_execution,
+    setup_directory, 
+    setup_logging, 
+    create_timestamp
+)
+from utils.validators import (
+    validate_dataframe, 
+    validate_file_path, 
+    validate_input
+)
+
 def initialize_application():
     """Initialize the entire machine learning training application."""
     try:
         # Set up logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        setup_logging(
+            log_file=config.directories.base_dir / 'app.log',
+            level=logging.INFO
         )
 
         # Initialize state management
@@ -392,7 +407,7 @@ def run_prediction_workflow(data: pd.DataFrame):
             notification_manager.show_error(f"Prediction Error: {str(e)}")
             logging.error("Prediction workflow failed", exc_info=True)
 
-def main():
+ddef main():
     """Main application entry point."""
     try:
         # Initialize application

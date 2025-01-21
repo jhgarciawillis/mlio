@@ -6,12 +6,15 @@ import inspect
 from typing import Any, Callable, Dict, Optional, Type
 from datetime import datetime
 
+# Update imports to include specific exceptions
 from core.exceptions import (
     MLTrainerException,
     ValidationError,
-    StateError
+    StateError,
+    ConfigurationError
 )
 from core.state_manager import state_manager
+from utils import logger  # Ensure this is the correct import path
 
 def monitor_performance(func: Callable) -> Callable:
     """Decorator to monitor function performance."""
@@ -36,7 +39,7 @@ def monitor_performance(func: Callable) -> Callable:
             
             # Store performance data in state
             state_manager.set_state(
-                f'metadata.performance.{func.__name__}.{datetime.now().isoformat()}',
+                f'performance.{func.__name__}.{datetime.now().isoformat()}',
                 performance_data
             )
             
@@ -53,12 +56,12 @@ def monitor_performance(func: Callable) -> Callable:
             }
             
             state_manager.set_state(
-                f'metadata.performance.{func.__name__}.{datetime.now().isoformat()}',
+                f'performance.{func.__name__}.{datetime.now().isoformat()}',
                 performance_data
             )
             
             raise
-            
+
     return wrapper
 
 def validate_input(validation_func: Optional[Callable] = None) -> Callable:
@@ -73,11 +76,17 @@ def validate_input(validation_func: Optional[Callable] = None) -> Callable:
             
             # Custom validation if provided
             if validation_func is not None:
-                validation_result = validation_func(*args, **kwargs)
-                if not validation_result:
+                try:
+                    validation_result = validation_func(*args, **kwargs)
+                    if not validation_result:
+                        raise ValidationError(
+                            f"Input validation failed for {func.__name__}",
+                            details={'args': args, 'kwargs': kwargs}
+                        )
+                except Exception as e:
                     raise ValidationError(
-                        f"Input validation failed for {func.__name__}",
-                        {'args': args, 'kwargs': kwargs}
+                        f"Validation error in {func.__name__}",
+                        details={'original_error': str(e)}
                     )
             
             # Type checking based on annotations
@@ -87,9 +96,10 @@ def validate_input(validation_func: Optional[Callable] = None) -> Callable:
                     if not isinstance(param_value, param_type):
                         raise ValidationError(
                             f"Type validation failed for parameter {param_name}",
-                            {
+                            details={
                                 'expected_type': str(param_type),
-                                'actual_type': str(type(param_value))
+                                'actual_type': str(type(param_value)),
+                                'value': str(param_value)
                             }
                         )
             
@@ -137,10 +147,10 @@ def handle_exceptions(
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
+            except (ValidationError, StateError, ConfigurationError):
+                # Re-raise specific exceptions
+                raise
             except Exception as e:
-                if isinstance(e, error_class):
-                    raise
-                    
                 error_msg = message or f"Error in {func.__name__}: {str(e)}"
                 raise error_class(error_msg, details={
                     'original_error': str(e),
@@ -162,7 +172,7 @@ def require_state(state_path: str) -> Callable:
                 if state is None:
                     raise StateError(
                         f"Required state not found: {state_path}",
-                        {'path': state_path}
+                        details={'path': state_path}
                     )
                 return func(*args, **kwargs)
             except Exception as e:
@@ -170,7 +180,7 @@ def require_state(state_path: str) -> Callable:
                     raise
                 raise StateError(
                     f"Error accessing state: {state_path}",
-                    {'path': state_path, 'error': str(e)}
+                    details={'path': state_path, 'error': str(e)}
                 ) from e
         return wrapper
     return decorator

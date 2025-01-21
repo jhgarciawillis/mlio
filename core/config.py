@@ -1,14 +1,17 @@
 import os
+import json
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Type
 from datetime import datetime
 
+# Importing model classes
 from sklearn.ensemble import RandomForestRegressor, AdaBoostRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 from sklearn.neighbors import KNeighborsRegressor
+import numpy as np
 
 # Base directory configuration
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,6 +46,7 @@ class DirectoryConfig:
     prediction_reports: Path = field(default_factory=lambda: BASE_DIR / "Prediction/Reports")
     prediction_visualizations: Path = field(default_factory=lambda: BASE_DIR / "Prediction/Visualizations")
     prediction_results: Path = field(default_factory=lambda: BASE_DIR / "Prediction/Results")
+    prediction_state: Path = field(default_factory=lambda: BASE_DIR / "Prediction/State")
 
     def __post_init__(self):
         """Create all directories after initialization."""
@@ -53,6 +57,18 @@ class DirectoryConfig:
         for field_name, field_value in self.__dict__.items():
             if isinstance(field_value, Path):
                 field_value.mkdir(parents=True, exist_ok=True)
+
+@dataclass
+class ValidationConfig:
+    """Configuration for data and input validation."""
+    default_min_rows: int = 1
+    default_max_rows: int = 100000
+    allow_nulls: bool = False
+    numeric_column_types: List[Type] = field(default_factory=lambda: [int, float, np.number])
+    categorical_column_types: List[Type] = field(default_factory=lambda: [str, object, 'category'])
+    min_string_length: int = 0
+    max_string_length: int = 1000
+    max_file_size: int = 200 * 1024 * 1024  # 200 MB
 
 @dataclass
 class FileConfig:
@@ -80,7 +96,6 @@ class FileConfig:
     
     # File upload configuration
     allowed_extensions: Set[str] = field(default_factory=lambda: {'csv', 'xlsx'})
-    max_file_size: int = 200 * 1024 * 1024  # 200 MB
 
 @dataclass
 class ProcessingConfig:
@@ -113,9 +128,15 @@ class ProcessingConfig:
 class ClusteringConfig:
     """Clustering-related configurations."""
     available_methods: List[str] = field(default_factory=lambda: [
-        'None', 'DBSCAN', 'KMeans'
+        'None', 'DBSCAN', 'KMeans', 'GaussianMixture'
     ])
     default_method: str = 'None'
+    
+    validation_config: Dict[str, Any] = field(default_factory=lambda: {
+        'min_samples_per_cluster': 5,
+        'max_clusters': 20,
+        'required_numeric_features': True
+    })
     
     dbscan_params: Dict[str, Any] = field(default_factory=lambda: {
         'eps': 0.5,
@@ -136,6 +157,15 @@ class ModelConfig:
         'ada': AdaBoostRegressor,
         'catboost': CatBoostRegressor,
         'knn': KNeighborsRegressor
+    })
+    
+    model_validation_config: Dict[str, Any] = field(default_factory=lambda: {
+        'required_params': {'model_type', 'hyperparameters'},
+        'param_type_constraints': {
+            'model_type': str,
+            'hyperparameters': dict
+        },
+        'param_range_constraints': {}
     })
     
     hyperparameter_grids: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
@@ -175,52 +205,33 @@ class ModelConfig:
     randomized_search_iterations: int = 10
     ensemble_cv_splits: int = 10
     ensemble_cv_shuffle: bool = True
-
-@dataclass
-class UIConfig:
-    """UI-related configurations."""
-    streamlit_theme: Dict[str, str] = field(default_factory=lambda: {
-        'primaryColor': '#FF4B4B',
-        'backgroundColor': '#FFFFFF',
-        'secondaryBackgroundColor': '#F0F2F6',
-        'textColor': '#262730',
-        'font': 'sans serif'
-    })
-    
-    app_name: str = 'ML Algo Trainer'
-    app_icon: str = '🧠'
-    
-    # Visualization configurations
-    max_rows_display: int = 100
-    chart_height: int = 400
-    chart_width: int = 600
-
-@dataclass
-class ModeConfig:
-    """Mode-related configurations."""
-    available_modes: List[str] = field(default_factory=lambda: [
-        'Analysis', 'Training', 'Prediction'
+    scoring_metrics: List[str] = field(default_factory=lambda: [
+        'r2', 'neg_mean_squared_error', 'neg_mean_absolute_error'
     ])
-    default_mode: str = 'Analysis'
-    mode_transitions: Dict[str, List[str]] = field(default_factory=lambda: {
-        'Analysis': ['Training'],
-        'Training': ['Prediction'],
-        'Prediction': ['Analysis', 'Training']
+
+@dataclass
+class FeatureEngineeringConfig:
+    """Feature engineering configuration."""
+    feature_validation_config: Dict[str, Any] = field(default_factory=lambda: {
+        'max_generated_features': 100,
+        'max_interaction_degree': 3,
+        'required_feature_types': ['numeric', 'categorical']
     })
 
 class ConfigManager:
     """Central configuration management class."""
     def __init__(self):
+        # Initialize all configurations
         self.directories = DirectoryConfig()
         self.files = FileConfig()
         self.processing = ProcessingConfig()
         self.clustering = ClusteringConfig()
         self.model = ModelConfig()
-        self.ui = UIConfig()
-        self.mode = ModeConfig()
+        self.validation = ValidationConfig()
+        self.feature_engineering = FeatureEngineeringConfig()
         
         # Runtime configurations
-        self.current_mode: str = self.mode.default_mode
+        self.current_mode: str = 'Analysis'
         self.file_path: Optional[str] = None
         self.sheet_name: Optional[str] = None
         self.target_column: Optional[str] = None
@@ -229,72 +240,59 @@ class ConfigManager:
         self.unused_columns: List[str] = []
         self.all_columns: List[str] = []
         
-        # Feature engineering flags
-        self.use_polynomial_features: bool = True
-        self.use_interaction_terms: bool = True
-        self.use_statistical_features: bool = True
-        
-        # Clustering flags
-        self.use_clustering: bool = False
-        self.clustering_config: Dict[str, Dict] = {}
-        self.clustering_2d_config: Dict[tuple, Dict] = {}
-        self.clustering_2d_columns: List[str] = []
-        
-        # Training parameters
-        self.train_size: float = 0.8
-        self.models_to_use: List[str] = []
-        self.tuning_method: str = 'None'
-        
-        # Initialize timestamps
+        # Initialization timestamps
         self.created_at = datetime.now()
         self.last_updated = datetime.now()
     
     def update(self, **kwargs) -> None:
-        """Update configuration parameters."""
+        """Update configuration parameters with type-safe and hierarchical updates."""
         for key, value in kwargs.items():
             if hasattr(self, key):
-                setattr(self, key, value)
+                attr = getattr(self, key)
                 
+                # Handle nested configuration updates
+                if isinstance(attr, (DirectoryConfig, FileConfig, ProcessingConfig, 
+                                     ClusteringConfig, ModelConfig, ValidationConfig)):
+                    for subkey, subvalue in value.items():
+                        if hasattr(attr, subkey):
+                            setattr(attr, subkey, subvalue)
+                else:
+                    setattr(self, key, value)
+        
+        # Update timestamps and columns
+        self.last_updated = datetime.now()
+        self._update_columns()
+    
+    def _update_columns(self):
+        """Update column-related configurations."""
         self.all_columns = list(set(
             self.numerical_columns +
             self.categorical_columns +
             ([self.target_column] if self.target_column else []) +
             self.unused_columns
         ))
-        self.last_updated = datetime.now()
-    
-    def set_mode(self, mode: str) -> None:
-        """Set current mode if valid."""
-        if mode in self.mode.available_modes:
-            self.current_mode = mode
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-    
-    def get_available_transitions(self) -> List[str]:
-        """Get available mode transitions from current mode."""
-        return self.mode.mode_transitions.get(self.current_mode, [])
     
     def validate(self) -> bool:
-        """Validate current configuration."""
+        """Validate entire configuration."""
         try:
-            assert self.current_mode in self.mode.available_modes
-            assert all(isinstance(col, str) for col in self.all_columns)
+            # Validate key configurations
+            assert self.current_mode in ['Analysis', 'Training', 'Prediction']
             assert isinstance(self.train_size, float) and 0 < self.train_size < 1
-            assert all(model in self.model.model_classes for model in self.models_to_use)
+            
             return True
         except AssertionError:
             return False
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert configuration to dictionary."""
+        """Convert configuration to a dictionary."""
         return {
             'directories': self.directories.__dict__,
             'files': self.files.__dict__,
             'processing': self.processing.__dict__,
             'clustering': self.clustering.__dict__,
             'model': self.model.__dict__,
-            'ui': self.ui.__dict__,
-            'mode': self.mode.__dict__,
+            'validation': self.validation.__dict__,
+            'feature_engineering': self.feature_engineering.__dict__,
             'runtime': {
                 'current_mode': self.current_mode,
                 'file_path': self.file_path,
@@ -303,17 +301,7 @@ class ConfigManager:
                 'numerical_columns': self.numerical_columns,
                 'categorical_columns': self.categorical_columns,
                 'unused_columns': self.unused_columns,
-                'all_columns': self.all_columns,
-                'use_polynomial_features': self.use_polynomial_features,
-                'use_interaction_terms': self.use_interaction_terms,
-                'use_statistical_features': self.use_statistical_features,
-                'use_clustering': self.use_clustering,
-                'clustering_config': self.clustering_config,
-                'clustering_2d_config': self.clustering_2d_config,
-                'clustering_2d_columns': self.clustering_2d_columns,
-                'train_size': self.train_size,
-                'models_to_use': self.models_to_use,
-                'tuning_method': self.tuning_method
+                'all_columns': self.all_columns
             },
             'metadata': {
                 'created_at': self.created_at.isoformat(),

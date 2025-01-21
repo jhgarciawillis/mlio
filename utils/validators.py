@@ -1,13 +1,13 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Union, Set, Tuple
-from pathlib import Path
+from typing import Dict, List, Optional, Any, Union, Set, Tuple, Type
+from datetime import datetime
+import re
+import os
 
 from core.exceptions import ValidationError
-from core.config import config
-from utils.decorators import log_execution, handle_exceptions
+from utils.decorators import handle_exceptions, log_execution
 
-@handle_exceptions(ValidationError)
 def validate_dataframe(
     df: pd.DataFrame,
     required_columns: Optional[List[str]] = None,
@@ -17,93 +17,149 @@ def validate_dataframe(
     max_rows: Optional[int] = None,
     allow_nulls: bool = False
 ) -> bool:
-    """Validate DataFrame against specified requirements."""
+    """
+    Validate DataFrame against specified requirements.
     
+    Args:
+        df (pd.DataFrame): DataFrame to validate
+        required_columns (List[str], optional): Columns that must be present
+        numeric_columns (List[str], optional): Columns that must be numeric
+        categorical_columns (List[str], optional): Columns that must be categorical
+        min_rows (int, optional): Minimum number of rows
+        max_rows (int, optional): Maximum number of rows
+        allow_nulls (bool, optional): Whether null values are allowed
+    
+    Returns:
+        bool: Whether the DataFrame passes validation
+    """
     # Check if DataFrame is empty
     if df.empty:
         raise ValidationError("DataFrame is empty")
     
-    # Validate row count
-    row_count = len(df)
-    if row_count < min_rows:
-        raise ValidationError(
-            f"DataFrame has fewer rows ({row_count}) than required ({min_rows})"
-        )
-    if max_rows and row_count > max_rows:
-        raise ValidationError(
-            f"DataFrame has more rows ({row_count}) than allowed ({max_rows})"
-        )
+    # Check row count
+    if len(df) < min_rows:
+        raise ValidationError(f"DataFrame must have at least {min_rows} rows")
+    
+    if max_rows is not None and len(df) > max_rows:
+        raise ValidationError(f"DataFrame must have no more than {max_rows} rows")
     
     # Check required columns
     if required_columns:
         missing_columns = set(required_columns) - set(df.columns)
         if missing_columns:
-            raise ValidationError(
-                f"Missing required columns: {missing_columns}"
-            )
+            raise ValidationError(f"Missing required columns: {missing_columns}")
     
     # Validate numeric columns
     if numeric_columns:
         for col in numeric_columns:
             if col not in df.columns:
-                raise ValidationError(f"Numeric column {col} not found in DataFrame")
+                raise ValidationError(f"Numeric column {col} not found")
             if not pd.api.types.is_numeric_dtype(df[col]):
                 raise ValidationError(f"Column {col} is not numeric")
     
-    # Validate categorical columns
-    if categorical_columns:
-        for col in categorical_columns:
-            if col not in df.columns:
-                raise ValidationError(f"Categorical column {col} not found in DataFrame")
-    
     # Check for nulls if not allowed
     if not allow_nulls and df.isnull().any().any():
-        null_counts = df.isnull().sum()
-        columns_with_nulls = null_counts[null_counts > 0]
-        raise ValidationError(
-            "Null values found in DataFrame",
-            {'columns_with_nulls': columns_with_nulls.to_dict()}
-        )
+        null_columns = df.columns[df.isnull().any()].tolist()
+        raise ValidationError(f"Null values found in columns: {null_columns}")
     
     return True
 
-@handle_exceptions(ValidationError)
 def validate_file_path(
-    file_path: Union[str, Path],
+    file_path: Union[str, os.PathLike],
     allowed_extensions: Optional[Set[str]] = None,
     must_exist: bool = True,
-    create_parent: bool = False,
+    min_size: Optional[int] = None,
     max_size: Optional[int] = None
 ) -> bool:
-    """Validate file path and properties."""
+    """
+    Validate file path with various checks.
     
-    # Convert to Path object
-    path = Path(file_path)
+    Args:
+        file_path (Union[str, os.PathLike]): Path to the file
+        allowed_extensions (Set[str], optional): Allowed file extensions
+        must_exist (bool, optional): Whether file must exist
+        min_size (int, optional): Minimum file size in bytes
+        max_size (int, optional): Maximum file size in bytes
     
-    # Check parent directory
-    if create_parent:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    elif must_exist and not path.parent.exists():
-        raise ValidationError(f"Parent directory does not exist: {path.parent}")
+    Returns:
+        bool: Whether the file path is valid
+    """
+    path = os.path.abspath(file_path)
     
     # Check file existence
-    if must_exist and not path.exists():
+    if must_exist and not os.path.exists(path):
         raise ValidationError(f"File does not exist: {path}")
     
-    # Validate extension
+    # Check file extension
     if allowed_extensions:
-        if path.suffix.lstrip('.').lower() not in allowed_extensions:
-            raise ValidationError(
-                f"Invalid file extension. Allowed: {allowed_extensions}"
-            )
+        file_ext = os.path.splitext(path)[1].lower().lstrip('.')
+        if file_ext not in allowed_extensions:
+            raise ValidationError(f"Invalid file extension. Allowed: {allowed_extensions}")
     
-    # Check file size if it exists and max_size is specified
-    if max_size and path.exists():
-        size = path.stat().st_size
-        if size > max_size:
-            raise ValidationError(
-                f"File size ({size} bytes) exceeds maximum ({max_size} bytes)"
-            )
+    # Check file size if file exists
+    if os.path.exists(path):
+        file_size = os.path.getsize(path)
+        
+        if min_size is not None and file_size < min_size:
+            raise ValidationError(f"File size too small. Minimum: {min_size} bytes")
+        
+        if max_size is not None and file_size > max_size:
+            raise ValidationError(f"File size too large. Maximum: {max_size} bytes")
+    
+    return True
+
+def validate_input(
+    value: Any, 
+    validator_type: Optional[Type] = None,
+    constraints: Optional[Dict[str, Any]] = None
+) -> bool:
+    """
+    Generic input validation function with flexible constraints.
+    
+    Args:
+        value (Any): Value to validate
+        validator_type (Type, optional): Expected type of the value
+        constraints (Dict[str, Any], optional): Additional validation constraints
+    
+    Returns:
+        bool: Whether the input is valid
+    
+    Raises:
+        ValidationError: If validation fails
+    """
+    # Type validation
+    if validator_type is not None:
+        if not isinstance(value, validator_type):
+            raise ValidationError(f"Expected type {validator_type.__name__}, got {type(value).__name__}")
+    
+    # Constraint validation
+    if constraints:
+        # String constraints
+        if isinstance(value, str):
+            if 'min_length' in constraints and len(value) < constraints['min_length']:
+                raise ValidationError(f"String too short. Minimum length: {constraints['min_length']}")
+            
+            if 'max_length' in constraints and len(value) > constraints['max_length']:
+                raise ValidationError(f"String too long. Maximum length: {constraints['max_length']}")
+            
+            if 'pattern' in constraints and not re.match(constraints['pattern'], value):
+                raise ValidationError(f"String does not match required pattern: {constraints['pattern']}")
+        
+        # Numeric constraints
+        elif isinstance(value, (int, float)):
+            if 'min_value' in constraints and value < constraints['min_value']:
+                raise ValidationError(f"Value too low. Minimum: {constraints['min_value']}")
+            
+            if 'max_value' in constraints and value > constraints['max_value']:
+                raise ValidationError(f"Value too high. Maximum: {constraints['max_value']}")
+        
+        # Date constraints
+        elif isinstance(value, datetime):
+            if 'min_date' in constraints and value < constraints['min_date']:
+                raise ValidationError(f"Date too early. Minimum: {constraints['min_date']}")
+            
+            if 'max_date' in constraints and value > constraints['max_date']:
+                raise ValidationError(f"Date too late. Maximum: {constraints['max_date']}")
     
     return True
 
