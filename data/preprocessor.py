@@ -2,12 +2,16 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Any, Union, Tuple
 from pathlib import Path
+from datetime import datetime
 from sklearn.preprocessing import (
     StandardScaler,
     MinMaxScaler,
     RobustScaler,
     PowerTransformer,
-    QuantileTransformer
+    QuantileTransformer,
+    OneHotEncoder,
+    LabelEncoder,
+    OrdinalEncoder
 )
 from sklearn.impute import SimpleImputer, KNNImputer
 from sklearn.compose import ColumnTransformer
@@ -27,32 +31,68 @@ class DataPreprocessor:
         self.preprocessing_history: List[Dict[str, Any]] = []
         self.preprocessing_pipelines: Dict[str, Pipeline] = {}
         self.scalers: Dict[str, Any] = {}
-        self.imputers: Dict[str, Any] = {}
         self.encoders: Dict[str, Any] = {}
+        self.imputers: Dict[str, Any] = {}
         self.feature_names: Dict[str, List[str]] = {}
+        
+        # Initialize available preprocessors
+        self.available_scalers = {
+            'standard': StandardScaler,
+            'minmax': MinMaxScaler,
+            'robust': RobustScaler,
+            'power': PowerTransformer,
+            'quantile': QuantileTransformer
+        }
+        
+        self.available_encoders = {
+            'onehot': OneHotEncoder,
+            'label': LabelEncoder,
+            'ordinal': OrdinalEncoder
+        }
+        
+        self.available_imputers = {
+            'simple': SimpleImputer,
+            'knn': KNNImputer
+        }
     
     @monitor_performance
     @handle_exceptions(PreprocessingError)
     def create_preprocessing_pipeline(
         self,
-        data: pd.DataFrame,
         numeric_features: List[str],
         categorical_features: List[str],
         scaling_method: str = 'standard',
-        imputation_method: str = 'mean',
         encoding_method: str = 'onehot',
-        pipeline_name: str = 'default_pipeline'
+        imputation_method: str = 'simple',
+        pipeline_name: str = 'default',
+        **kwargs
     ) -> Pipeline:
-        """Create preprocessing pipeline based on specified methods."""
+        """Create preprocessing pipeline."""
         try:
-            numeric_transformer = self._create_numeric_pipeline(
+            # Record operation start
+            state_monitor.record_operation_start(
+                'preprocessing_pipeline_creation',
+                'preprocessing'
+            )
+            
+            # Validate methods
+            self._validate_methods(
                 scaling_method,
+                encoding_method,
                 imputation_method
             )
             
-            categorical_transformer = self._create_categorical_pipeline(
+            # Create transformers for numeric and categorical features
+            numeric_transformer = self._create_numeric_pipeline(
+                scaling_method,
                 imputation_method,
-                encoding_method
+                **kwargs
+            )
+            
+            categorical_transformer = self._create_categorical_pipeline(
+                encoding_method,
+                imputation_method,
+                **kwargs
             )
             
             # Create column transformer
@@ -64,254 +104,276 @@ class DataPreprocessor:
                 remainder='drop'
             )
             
-            # Create full pipeline
+            # Create pipeline
             pipeline = Pipeline([
                 ('preprocessor', preprocessor)
             ])
             
-            # Store pipeline
+            # Store pipeline and feature names
             self.preprocessing_pipelines[pipeline_name] = pipeline
-            
-            # Store feature names
             self.feature_names[pipeline_name] = numeric_features + categorical_features
             
-            # Record preprocessing configuration
-            self._record_preprocessing_config(
+            # Record creation in history
+            self._record_pipeline_creation(
                 pipeline_name,
                 {
                     'numeric_features': numeric_features,
                     'categorical_features': categorical_features,
                     'scaling_method': scaling_method,
+                    'encoding_method': encoding_method,
                     'imputation_method': imputation_method,
-                    'encoding_method': encoding_method
+                    'additional_params': kwargs
                 }
+            )
+            
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'preprocessing_pipeline_creation',
+                'completed'
             )
             
             return pipeline
             
         except Exception as e:
+            state_monitor.record_operation_end(
+                'preprocessing_pipeline_creation',
+                'failed',
+                {'error': str(e)}
+            )
             raise PreprocessingError(
-                f"Error creating preprocessing pipeline: {str(e)}",
-                details={
-                    'pipeline_name': pipeline_name,
-                    'scaling_method': scaling_method,
-                    'imputation_method': imputation_method,
-                    'encoding_method': encoding_method
-                }
+                f"Error creating preprocessing pipeline: {str(e)}"
             ) from e
     
+    @monitor_performance
     def _create_numeric_pipeline(
         self,
         scaling_method: str,
-        imputation_method: str
+        imputation_method: str,
+        **kwargs
     ) -> Pipeline:
         """Create preprocessing pipeline for numeric features."""
         steps = []
         
         # Add imputer
-        imputer = self._get_imputer(imputation_method)
+        imputer = self._get_imputer(
+            imputation_method,
+            numeric=True,
+            **kwargs.get('imputer_params', {})
+        )
         steps.append(('imputer', imputer))
         
         # Add scaler
-        scaler = self._get_scaler(scaling_method)
+        scaler = self._get_scaler(
+            scaling_method,
+            **kwargs.get('scaler_params', {})
+        )
         steps.append(('scaler', scaler))
         
         return Pipeline(steps)
     
+    @monitor_performance
     def _create_categorical_pipeline(
         self,
+        encoding_method: str,
         imputation_method: str,
-        encoding_method: str
+        **kwargs
     ) -> Pipeline:
         """Create preprocessing pipeline for categorical features."""
         steps = []
         
         # Add imputer
-        imputer = self._get_imputer(imputation_method, categorical=True)
+        imputer = self._get_imputer(
+            imputation_method,
+            numeric=False,
+            **kwargs.get('imputer_params', {})
+        )
         steps.append(('imputer', imputer))
         
         # Add encoder
-        encoder = self._get_encoder(encoding_method)
+        encoder = self._get_encoder(
+            encoding_method,
+            **kwargs.get('encoder_params', {})
+        )
         steps.append(('encoder', encoder))
         
         return Pipeline(steps)
     
-    def _get_scaler(self, method: str) -> Any:
-        """Get scaler based on method."""
-        scalers = {
-            'standard': StandardScaler(),
-            'minmax': MinMaxScaler(),
-            'robust': RobustScaler(),
-            'power': PowerTransformer(),
-            'quantile': QuantileTransformer(output_distribution='normal')
-        }
-        
-        if method not in scalers:
+    def _get_scaler(
+        self,
+        method: str,
+        **kwargs
+    ) -> Any:
+        """Get scaler instance."""
+        if method not in self.available_scalers:
             raise PreprocessingError(
                 f"Invalid scaling method: {method}",
-                details={'available_methods': list(scalers.keys())}
+                details={'available_methods': list(self.available_scalers.keys())}
             )
         
-        return scalers[method]
+        return self.available_scalers[method](**kwargs)
+    
+    def _get_encoder(
+        self,
+        method: str,
+        **kwargs
+    ) -> Any:
+        """Get encoder instance."""
+        if method not in self.available_encoders:
+            raise PreprocessingError(
+                f"Invalid encoding method: {method}",
+                details={'available_methods': list(self.available_encoders.keys())}
+            )
+        
+        return self.available_encoders[method](**kwargs)
     
     def _get_imputer(
         self,
         method: str,
-        categorical: bool = False
+        numeric: bool = True,
+        **kwargs
     ) -> Any:
-        """Get imputer based on method."""
-        if categorical:
-            return SimpleImputer(
-                strategy='constant',
-                fill_value='missing'
-            )
-        
-        imputers = {
-            'mean': SimpleImputer(strategy='mean'),
-            'median': SimpleImputer(strategy='median'),
-            'most_frequent': SimpleImputer(strategy='most_frequent'),
-            'knn': KNNImputer(n_neighbors=5)
-        }
-        
-        if method not in imputers:
+        """Get imputer instance."""
+        if method not in self.available_imputers:
             raise PreprocessingError(
                 f"Invalid imputation method: {method}",
-                details={'available_methods': list(imputers.keys())}
+                details={'available_methods': list(self.available_imputers.keys())}
             )
         
-        return imputers[method]
-    
-    def _get_encoder(self, method: str) -> Any:
-        """Get encoder based on method."""
-        from sklearn.preprocessing import OneHotEncoder, LabelEncoder, OrdinalEncoder
+        if method == 'simple':
+            if numeric:
+                kwargs.setdefault('strategy', 'mean')
+            else:
+                kwargs.setdefault('strategy', 'most_frequent')
         
-        encoders = {
-            'onehot': OneHotEncoder(sparse=False, handle_unknown='ignore'),
-            'label': LabelEncoder(),
-            'ordinal': OrdinalEncoder()
+        return self.available_imputers[method](**kwargs)
+    
+    def _validate_methods(
+        self,
+        scaling_method: str,
+        encoding_method: str,
+        imputation_method: str
+    ) -> None:
+        """Validate preprocessing methods."""
+        if scaling_method not in self.available_scalers:
+            raise PreprocessingError(f"Invalid scaling method: {scaling_method}")
+        
+        if encoding_method not in self.available_encoders:
+            raise PreprocessingError(f"Invalid encoding method: {encoding_method}")
+        
+        if imputation_method not in self.available_imputers:
+            raise PreprocessingError(f"Invalid imputation method: {imputation_method}")
+    
+    def _record_pipeline_creation(
+        self,
+        pipeline_name: str,
+        config: Dict[str, Any]
+    ) -> None:
+        """Record pipeline creation in history."""
+        record = {
+            'timestamp': datetime.now().isoformat(),
+            'pipeline_name': pipeline_name,
+            'configuration': config
         }
         
-        if method not in encoders:
-            raise PreprocessingError(
-                f"Invalid encoding method: {method}",
-                details={'available_methods': list(encoders.keys())}
-            )
+        self.preprocessing_history.append(record)
         
-        return encoders[method]
+        # Update state
+        state_manager.set_state(
+            f'preprocessing.pipelines.{pipeline_name}',
+            record
+        )
     
     @monitor_performance
     @handle_exceptions(PreprocessingError)
     def fit_transform(
         self,
         data: pd.DataFrame,
-        pipeline_name: str = 'default_pipeline'
+        pipeline_name: str = 'default'
     ) -> pd.DataFrame:
         """Fit and transform data using specified pipeline."""
         try:
+            # Record operation start
+            state_monitor.record_operation_start('preprocessing_fit_transform', 'preprocessing')
+            
             pipeline = self.preprocessing_pipelines.get(pipeline_name)
             if pipeline is None:
-                raise PreprocessingError(
-                    f"Pipeline not found: {pipeline_name}"
-                )
+                raise PreprocessingError(f"Pipeline not found: {pipeline_name}")
             
-            # Fit and transform
+            # Fit and transform data
             transformed_data = pipeline.fit_transform(data)
             
-            # Convert to DataFrame with proper column names
+            # Get feature names
             feature_names = self.feature_names[pipeline_name]
+            
+            # Create DataFrame with proper column names
             transformed_df = pd.DataFrame(
                 transformed_data,
                 index=data.index,
                 columns=feature_names
             )
             
-            # Record preprocessing step
-            self._record_preprocessing_step(
-                pipeline_name,
-                'fit_transform',
-                data.shape,
-                transformed_df.shape
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'preprocessing_fit_transform',
+                'completed',
+                {'shape': transformed_df.shape}
             )
             
             return transformed_df
             
         except Exception as e:
-            raise PreprocessingError(
-                f"Error in fit_transform: {str(e)}",
-                details={'pipeline_name': pipeline_name}
-            ) from e
+            state_monitor.record_operation_end(
+                'preprocessing_fit_transform',
+                'failed',
+                {'error': str(e)}
+            )
+            raise PreprocessingError(f"Error in fit_transform: {str(e)}") from e
     
     @monitor_performance
     @handle_exceptions(PreprocessingError)
     def transform(
         self,
         data: pd.DataFrame,
-        pipeline_name: str = 'default_pipeline'
+        pipeline_name: str = 'default'
     ) -> pd.DataFrame:
         """Transform data using fitted pipeline."""
         try:
+            # Record operation start
+            state_monitor.record_operation_start('preprocessing_transform', 'preprocessing')
+            
             pipeline = self.preprocessing_pipelines.get(pipeline_name)
             if pipeline is None:
-                raise PreprocessingError(
-                    f"Pipeline not found: {pipeline_name}"
-                )
+                raise PreprocessingError(f"Pipeline not found: {pipeline_name}")
             
-            # Transform
+            # Transform data
             transformed_data = pipeline.transform(data)
             
-            # Convert to DataFrame with proper column names
+            # Get feature names
             feature_names = self.feature_names[pipeline_name]
+            
+            # Create DataFrame with proper column names
             transformed_df = pd.DataFrame(
                 transformed_data,
                 index=data.index,
                 columns=feature_names
             )
             
-            # Record preprocessing step
-            self._record_preprocessing_step(
-                pipeline_name,
-                'transform',
-                data.shape,
-                transformed_df.shape
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'preprocessing_transform',
+                'completed',
+                {'shape': transformed_df.shape}
             )
             
             return transformed_df
             
         except Exception as e:
-            raise PreprocessingError(
-                f"Error in transform: {str(e)}",
-                details={'pipeline_name': pipeline_name}
-            ) from e
-    
-    def _record_preprocessing_config(
-        self,
-        pipeline_name: str,
-        config: Dict[str, Any]
-    ) -> None:
-        """Record preprocessing configuration."""
-        self.preprocessing_history.append({
-            'timestamp': pd.Timestamp.now().isoformat(),
-            'pipeline_name': pipeline_name,
-            'type': 'configuration',
-            'config': config
-        })
-    
-    def _record_preprocessing_step(
-        self,
-        pipeline_name: str,
-        operation: str,
-        input_shape: Tuple[int, int],
-        output_shape: Tuple[int, int]
-    ) -> None:
-        """Record preprocessing step."""
-        self.preprocessing_history.append({
-            'timestamp': pd.Timestamp.now().isoformat(),
-            'pipeline_name': pipeline_name,
-            'type': 'operation',
-            'operation': operation,
-            'input_shape': input_shape,
-            'output_shape': output_shape
-        })
+            state_monitor.record_operation_end(
+                'preprocessing_transform',
+                'failed',
+                {'error': str(e)}
+            )
+            raise PreprocessingError(f"Error in transform: {str(e)}") from e
     
     @monitor_performance
     def save_pipeline(
@@ -321,15 +383,12 @@ class DataPreprocessor:
     ) -> None:
         """Save preprocessing pipeline."""
         if path is None:
-            path = config.directories.base_dir / 'preprocessing'
-        
-        path.mkdir(parents=True, exist_ok=True)
+            path = config.directories.preprocessors
+            path.mkdir(parents=True, exist_ok=True)
         
         pipeline = self.preprocessing_pipelines.get(pipeline_name)
         if pipeline is None:
-            raise PreprocessingError(
-                f"Pipeline not found: {pipeline_name}"
-            )
+            raise PreprocessingError(f"Pipeline not found: {pipeline_name}")
         
         # Save pipeline
         pipeline_path = path / f"{pipeline_name}_pipeline.joblib"
@@ -355,14 +414,12 @@ class DataPreprocessor:
     ) -> None:
         """Load preprocessing pipeline."""
         if path is None:
-            path = config.directories.base_dir / 'preprocessing'
+            path = config.directories.preprocessors
         
         # Load pipeline
         pipeline_path = path / f"{pipeline_name}_pipeline.joblib"
         if not pipeline_path.exists():
-            raise PreprocessingError(
-                f"Pipeline file not found: {pipeline_path}"
-            )
+            raise PreprocessingError(f"Pipeline file not found: {pipeline_path}")
         
         self.preprocessing_pipelines[pipeline_name] = joblib.load(pipeline_path)
         
@@ -379,6 +436,52 @@ class DataPreprocessor:
                 self.preprocessing_history = json.load(f)
         
         logger.info(f"Preprocessing pipeline loaded from {path}")
+    
+    @monitor_performance
+    def get_preprocessing_summary(
+        self,
+        pipeline_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get summary of preprocessing operations."""
+        if pipeline_name:
+            pipeline = self.preprocessing_pipelines.get(pipeline_name)
+            if pipeline is None:
+                raise PreprocessingError(f"Pipeline not found: {pipeline_name}")
+            
+            return {
+                'pipeline_name': pipeline_name,
+                'feature_names': self.feature_names[pipeline_name],
+                'history': [
+                    record for record in self.preprocessing_history
+                    if record['pipeline_name'] == pipeline_name
+                ]
+            }
+        
+        return {
+            'total_pipelines': len(self.preprocessing_pipelines),
+            'pipelines': list(self.preprocessing_pipelines.keys()),
+            'history_length': len(self.preprocessing_history),
+            'last_operation': self.preprocessing_history[-1] if self.preprocessing_history else None
+        }
+    
+    @monitor_performance
+    def reset_pipeline(
+        self,
+        pipeline_name: str
+    ) -> None:
+        """Reset specified pipeline to initial state."""
+        if pipeline_name in self.preprocessing_pipelines:
+            del self.preprocessing_pipelines[pipeline_name]
+        if pipeline_name in self.feature_names:
+            del self.feature_names[pipeline_name]
+            
+        # Update state
+        state_manager.set_state(
+            f'preprocessing.pipelines.{pipeline_name}',
+            None
+        )
+        
+        logger.info(f"Pipeline {pipeline_name} reset")
 
 # Create global preprocessor instance
 preprocessor = DataPreprocessor()

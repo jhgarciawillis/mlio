@@ -2,15 +2,21 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Any, Union, Tuple
 from datetime import datetime
-from sklearn.metrics import confusion_matrix, classification_report
 import scipy.stats as stats
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    explained_variance_score,
+    mean_absolute_percentage_error,
+    median_absolute_error
+)
 
 from core import config
 from core.exceptions import MetricError
 from core.state_manager import state_manager
 from utils import logger
 from utils.decorators import monitor_performance, handle_exceptions, log_execution
-from metrics import calculator
 from visualization import plotter
 
 class MetricsEvaluator:
@@ -27,137 +33,101 @@ class MetricsEvaluator:
         self,
         y_true: Union[pd.Series, np.ndarray],
         y_pred: Union[pd.Series, np.ndarray],
+        cluster_labels: Optional[np.ndarray] = None,
         evaluation_config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Evaluate model performance metrics."""
         try:
+            # Record operation start
+            state_monitor.record_operation_start(
+                'metric_evaluation',
+                'evaluation',
+                {'clustering_enabled': cluster_labels is not None}
+            )
+            
             evaluation_id = f"evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
             if evaluation_config is None:
                 evaluation_config = self._get_default_evaluation_config()
             
             results = {
-                'basic_metrics': metrics_calculator.calculate_metrics(
-                    y_true, y_pred,
-                    metrics=evaluation_config.get('metrics', None)
-                ),
-                'performance_analysis': self._analyze_performance(
-                    y_true, y_pred
-                ),
-                'error_analysis': self._analyze_errors(
-                    y_true, y_pred
-                )
+                'overall_metrics': self._calculate_overall_metrics(y_true, y_pred),
+                'error_analysis': self._analyze_errors(y_true, y_pred),
+                'distribution_analysis': self._analyze_distributions(y_true, y_pred)
             }
             
-            # Add threshold evaluation if thresholds are set
-            if self.performance_thresholds:
-                results['threshold_evaluation'] = self._evaluate_thresholds(
-                    results['basic_metrics']
+            # Add cluster-specific analysis if clustering is enabled
+            if cluster_labels is not None:
+                results['cluster_metrics'] = self._calculate_cluster_metrics(
+                    y_true, y_pred, cluster_labels
                 )
             
-            # Create visualizations
+            # Add visualizations
             results['visualizations'] = self._create_evaluation_visualizations(
-                y_true, y_pred, results
+                y_true, y_pred, cluster_labels
             )
             
             # Store results
             self.evaluation_results[evaluation_id] = results
             
             # Record evaluation
-            self._record_evaluation(evaluation_id, evaluation_config)
+            self._record_evaluation(evaluation_id, results)
+            
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'metric_evaluation',
+                'completed',
+                {'evaluation_id': evaluation_id}
+            )
             
             return results
             
         except Exception as e:
-            raise MetricError(
-                f"Error evaluating metrics: {str(e)}"
-            ) from e
+            state_monitor.record_operation_end(
+                'metric_evaluation',
+                'failed',
+                {'error': str(e)}
+            )
+            raise MetricError(f"Error evaluating metrics: {str(e)}") from e
     
     @monitor_performance
-    def set_performance_thresholds(
-        self,
-        thresholds: Dict[str, float]
-    ) -> None:
-        """Set performance threshold values."""
-        valid_metrics = metrics_calculator.get_available_metrics()
-        invalid_metrics = set(thresholds.keys()) - set(valid_metrics)
-        
-        if invalid_metrics:
-            raise MetricError(f"Invalid metrics in thresholds: {invalid_metrics}")
-            
-        self.performance_thresholds = thresholds
-        logger.info(f"Set performance thresholds: {thresholds}")
-    
-    def _analyze_performance(
+    def _calculate_overall_metrics(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray
-    ) -> Dict[str, Any]:
-        """Analyze model performance patterns."""
-        analysis = {
-            'value_ranges': self._analyze_value_ranges(y_true, y_pred),
-            'bias_analysis': self._analyze_prediction_bias(y_true, y_pred),
-            'error_patterns': self._analyze_error_patterns(y_true, y_pred)
+    ) -> Dict[str, float]:
+        """Calculate overall performance metrics."""
+        return {
+            'mse': float(mean_squared_error(y_true, y_pred)),
+            'rmse': float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            'mae': float(mean_absolute_error(y_true, y_pred)),
+            'r2': float(r2_score(y_true, y_pred)),
+            'explained_variance': float(explained_variance_score(y_true, y_pred)),
+            'mape': float(mean_absolute_percentage_error(y_true, y_pred)),
+            'median_ae': float(median_absolute_error(y_true, y_pred)),
+            'correlation': float(np.corrcoef(y_true, y_pred)[0, 1])
         }
-        
-        return analysis
     
-    def _analyze_value_ranges(
+    @monitor_performance
+    def _calculate_cluster_metrics(
         self,
         y_true: np.ndarray,
-        y_pred: np.ndarray
-    ) -> Dict[str, Any]:
-        """Analyze performance across value ranges."""
-        # Create value bins
-        bins = pd.qcut(y_true, q=10, duplicates='drop')
+        y_pred: np.ndarray,
+        cluster_labels: np.ndarray
+    ) -> Dict[str, Dict[str, float]]:
+        """Calculate metrics for each cluster."""
+        cluster_metrics = {}
         
-        range_analysis = {}
-        for bin_label in bins.unique():
-            mask = bins == bin_label
-            if mask.any():
-                range_metrics = metrics_calculator.calculate_metrics(
+        for label in np.unique(cluster_labels):
+            mask = cluster_labels == label
+            if np.sum(mask) > 0:  # Only calculate if cluster has samples
+                cluster_metrics[int(label)] = self._calculate_overall_metrics(
                     y_true[mask], y_pred[mask]
                 )
-                range_analysis[str(bin_label)] = range_metrics
         
-        return range_analysis
+        return cluster_metrics
     
-    def _analyze_prediction_bias(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray
-    ) -> Dict[str, Any]:
-        """Analyze prediction bias."""
-        errors = y_pred - y_true
-        
-        return {
-            'overall_bias': float(np.mean(errors)),
-            'bias_std': float(np.std(errors)),
-            'positive_bias_ratio': float(np.mean(errors > 0)),
-            'negative_bias_ratio': float(np.mean(errors < 0))
-        }
-    
-    def _analyze_error_patterns(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray
-    ) -> Dict[str, Any]:
-        """Analyze patterns in prediction errors."""
-        errors = np.abs(y_pred - y_true)
-        
-        return {
-            'error_distribution': {
-                'mean': float(np.mean(errors)),
-                'std': float(np.std(errors)),
-                'skew': float(stats.skew(errors)),
-                'kurtosis': float(stats.kurtosis(errors))
-            },
-            'percentile_errors': {
-                str(p): float(np.percentile(errors, p))
-                for p in [25, 50, 75, 90, 95, 99]
-            }
-        }
-    
+    @monitor_performance
     def _analyze_errors(
         self,
         y_true: np.ndarray,
@@ -172,8 +142,6 @@ class MetricsEvaluator:
                 'mean_error': float(np.mean(errors)),
                 'median_error': float(np.median(errors)),
                 'std_error': float(np.std(errors)),
-                'mean_absolute_error': float(np.mean(abs_errors)),
-                'median_absolute_error': float(np.median(abs_errors)),
                 'max_error': float(np.max(abs_errors)),
                 'min_error': float(np.min(abs_errors))
             },
@@ -181,7 +149,36 @@ class MetricsEvaluator:
                 'skewness': float(stats.skew(errors)),
                 'kurtosis': float(stats.kurtosis(errors)),
                 'normality_test': self._test_error_normality(errors)
+            },
+            'error_percentiles': {
+                f'p{p}': float(np.percentile(abs_errors, p))
+                for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]
             }
+        }
+    
+    @monitor_performance
+    def _analyze_distributions(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray
+    ) -> Dict[str, Any]:
+        """Analyze true vs predicted distributions."""
+        return {
+            'true_distribution': {
+                'mean': float(np.mean(y_true)),
+                'std': float(np.std(y_true)),
+                'median': float(np.median(y_true)),
+                'skew': float(stats.skew(y_true)),
+                'kurtosis': float(stats.kurtosis(y_true))
+            },
+            'pred_distribution': {
+                'mean': float(np.mean(y_pred)),
+                'std': float(np.std(y_pred)),
+                'median': float(np.median(y_pred)),
+                'skew': float(stats.skew(y_pred)),
+                'kurtosis': float(stats.kurtosis(y_pred))
+            },
+            'distribution_comparison': self._compare_distributions(y_true, y_pred)
         }
     
     def _test_error_normality(
@@ -196,93 +193,92 @@ class MetricsEvaluator:
             'is_normal': float(p_value) > 0.05
         }
     
-    def _evaluate_thresholds(
+    def _compare_distributions(
         self,
-        metrics: Dict[str, float]
-    ) -> Dict[str, bool]:
-        """Evaluate metrics against set thresholds."""
+        y_true: np.ndarray,
+        y_pred: np.ndarray
+    ) -> Dict[str, float]:
+        """Compare true and predicted distributions."""
+        ks_stat, ks_pval = stats.ks_2samp(y_true, y_pred)
         return {
-            metric: metrics[metric] >= threshold
-            for metric, threshold in self.performance_thresholds.items()
-            if metric in metrics
+            'ks_statistic': float(ks_stat),
+            'ks_p_value': float(ks_pval),
+            'distributions_similar': float(ks_pval) > 0.05
         }
     
     def _create_evaluation_visualizations(
         self,
         y_true: np.ndarray,
         y_pred: np.ndarray,
-        results: Dict[str, Any]
+        cluster_labels: Optional[np.ndarray] = None
     ) -> Dict[str, Any]:
         """Create evaluation visualizations."""
         visualizations = {}
         
-        # Actual vs Predicted
+        # Actual vs Predicted plot
         visualizations['actual_vs_predicted'] = plotter.create_plot(
             'scatter',
-            data=pd.DataFrame({
-                'Actual': y_true,
-                'Predicted': y_pred
-            }),
+            pd.DataFrame({'Actual': y_true, 'Predicted': y_pred}),
             x='Actual',
             y='Predicted',
             title='Actual vs Predicted Values'
         )
         
-        # Error Distribution
+        # Error distribution plot
         errors = y_true - y_pred
         visualizations['error_distribution'] = plotter.create_plot(
             'histogram',
-            data=pd.DataFrame({'Error': errors}),
+            pd.DataFrame({'Error': errors}),
             x='Error',
             title='Error Distribution'
         )
         
-        # Error vs Predicted
-        visualizations['error_vs_predicted'] = plotter.create_plot(
-            'scatter',
-            data=pd.DataFrame({
-                'Predicted': y_pred,
-                'Error': errors
-            }),
-            x='Predicted',
-            y='Error',
-            title='Error vs Predicted Values'
+        # Q-Q plot
+        visualizations['qq_plot'] = plotter.create_plot(
+            'qq',
+            data=errors,
+            title='Q-Q Plot of Errors'
         )
         
-        # Performance by Value Range
-        range_metrics = pd.DataFrame(results['performance_analysis']['value_ranges']).T
-        visualizations['range_performance'] = plotter.create_plot(
-            'line',
-            data=range_metrics.reset_index(),
-            x='index',
-            y='r2',
-            title='R² Score by Value Range'
-        )
+        # Add cluster-specific visualizations if clustering is enabled
+        if cluster_labels is not None:
+            cluster_vis = {}
+            for label in np.unique(cluster_labels):
+                mask = cluster_labels == label
+                if np.sum(mask) > 0:
+                    cluster_vis[f'cluster_{label}'] = plotter.create_plot(
+                        'scatter',
+                        pd.DataFrame({
+                            'Actual': y_true[mask],
+                            'Predicted': y_pred[mask]
+                        }),
+                        x='Actual',
+                        y='Predicted',
+                        title=f'Actual vs Predicted (Cluster {label})'
+                    )
+            visualizations['cluster_plots'] = cluster_vis
         
         return visualizations
     
     def _get_default_evaluation_config(self) -> Dict[str, Any]:
         """Get default evaluation configuration."""
         return {
-            'metrics': None,  # Use all available metrics
-            'value_range_bins': 10,
-            'error_percentiles': [25, 50, 75, 90, 95, 99],
-            'visualization_config': {
-                'width': config.ui.chart_width,
-                'height': config.ui.chart_height
-            }
+            'calculate_overall_metrics': True,
+            'analyze_errors': True,
+            'analyze_distributions': True,
+            'create_visualizations': True
         }
     
     def _record_evaluation(
         self,
         evaluation_id: str,
-        config: Dict[str, Any]
+        results: Dict[str, Any]
     ) -> None:
         """Record evaluation in history."""
         record = {
             'timestamp': datetime.now().isoformat(),
             'evaluation_id': evaluation_id,
-            'configuration': config
+            'metrics': results['overall_metrics']
         }
         
         self.evaluation_history.append(record)

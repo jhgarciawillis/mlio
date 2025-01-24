@@ -1,5 +1,5 @@
 import streamlit as st
-from typing import Dict, List, Optional, Any, Union, Tuple, Callable
+from typing import Dict, List, Optional, Any, Union, Tuple
 from datetime import datetime
 
 from core import config
@@ -8,6 +8,7 @@ from core.state_manager import state_manager
 from utils import logger
 from utils.decorators import monitor_performance, handle_exceptions, log_execution
 from ui.components import ui_components
+from ui.settings import ui_settings
 
 class LayoutManager:
     """Handle UI layout management."""
@@ -17,6 +18,16 @@ class LayoutManager:
         self.active_layouts: Dict[str, Dict[str, Any]] = {}
         self.section_callbacks: Dict[str, Callable] = {}
         
+        # Layout templates
+        self.templates = {
+            'analysis': self._create_analysis_template(),
+            'training': self._create_training_template(),
+            'prediction': self._create_prediction_template(),
+            'clustering': self._create_clustering_template(),
+            'metrics': self._create_metrics_template(),
+            'evaluation': self._create_evaluation_template()
+        }
+    
     @monitor_performance
     @handle_exceptions(UIError)
     def create_main_layout(
@@ -26,31 +37,39 @@ class LayoutManager:
         layout_config: Optional[Dict[str, Any]] = None
     ) -> None:
         """Create main application layout."""
-        # Set page config
-        st.set_page_config(
-            page_title=title,
-            page_icon=config.ui.app_icon,
-            layout="wide",
-            initial_sidebar_state="expanded"
+        # Record operation start
+        state_monitor.record_operation_start(
+            'layout_creation',
+            'layout',
+            {'title': title}
         )
         
-        # Create main title
-        st.title(title)
-        
-        # Create sidebar if config provided
-        if sidebar_config:
-            self._create_sidebar_layout(sidebar_config)
-        
-        # Create main layout
-        if layout_config:
-            self._create_content_layout(layout_config)
+        try:
+            # Set page config
+            st.set_page_config(
+                page_title=title,
+                page_icon=config.ui.app_icon,
+                layout=ui_settings.settings['layout']['content_width'],
+                initial_sidebar_state="expanded"
+            )
             
-        # Track layout creation
-        self._track_layout("main", {
-            'title': title,
-            'sidebar_config': sidebar_config,
-            'layout_config': layout_config
-        })
+            # Create main title
+            st.title(title)
+            
+            # Create sidebar if config provided
+            if sidebar_config:
+                self._create_sidebar_layout(sidebar_config)
+            
+            # Create main layout
+            if layout_config:
+                self._create_content_layout(layout_config)
+            
+            # Record operation completion
+            state_monitor.record_operation_end('layout_creation', 'completed')
+            
+        except Exception as e:
+            state_monitor.record_operation_end('layout_creation', 'failed', {'error': str(e)})
+            raise
     
     @monitor_performance
     def create_analysis_layout(
@@ -58,202 +77,188 @@ class LayoutManager:
         data: Optional[pd.DataFrame] = None
     ) -> None:
         """Create analysis mode layout."""
+        with st.expander("Data Overview", expanded=True):
+            if data is not None:
+                ui_components.create_data_overview(data)
+            else:
+                st.info("Please upload data to begin analysis")
+        
         tabs = st.tabs([
-            "Data Overview",
             "Statistical Analysis",
-            "Visualizations",
-            "Data Quality"
+            "Feature Analysis",
+            "Clustering Analysis",
+            "Quality Analysis"
         ])
         
         with tabs[0]:
-            self._create_data_overview_section(data)
-            
-        with tabs[1]:
             self._create_statistical_analysis_section(data)
-            
+        
+        with tabs[1]:
+            self._create_feature_analysis_section(data)
+        
         with tabs[2]:
-            self._create_visualization_section(data)
-            
+            self._create_clustering_analysis_section(data)
+        
         with tabs[3]:
-            self._create_data_quality_section(data)
-            
-        # Track layout
-        self._track_layout("analysis", {
-            'has_data': data is not None
-        })
+            self._create_quality_analysis_section(data)
     
     @monitor_performance
-    def create_training_layout(
+    def create_clustering_layout(
         self,
         data: Optional[pd.DataFrame] = None
     ) -> None:
-        """Create training mode layout."""
-        tabs = st.tabs([
-            "Data Preparation",
-            "Model Configuration",
-            "Training Progress",
-            "Results"
-        ])
+        """Create clustering mode layout."""
+        st.header("Clustering Analysis")
         
-        with tabs[0]:
-            self._create_data_preparation_section(data)
+        if data is not None:
+            # Clustering configuration
+            with st.expander("Clustering Configuration", expanded=True):
+                clustering_config = ui_components.create_clustering_config_form()
             
-        with tabs[1]:
-            self._create_model_configuration_section()
-            
-        with tabs[2]:
-            self._create_training_progress_section()
-            
-        with tabs[3]:
-            self._create_training_results_section()
-            
-        # Track layout
-        self._track_layout("training", {
-            'has_data': data is not None
-        })
-    
-    @monitor_performance
-    def create_prediction_layout(
-        self,
-        data: Optional[pd.DataFrame] = None
-    ) -> None:
-        """Create prediction mode layout."""
-        tabs = st.tabs([
-            "Model Selection",
-            "Prediction Input",
-            "Results",
-            "Analysis"
-        ])
-        
-        with tabs[0]:
-            self._create_model_selection_section()
-            
-        with tabs[1]:
-            self._create_prediction_input_section(data)
-            
-        with tabs[2]:
-            self._create_prediction_results_section()
-            
-        with tabs[3]:
-            self._create_prediction_analysis_section()
-            
-        # Track layout
-        self._track_layout("prediction", {
-            'has_data': data is not None
-        })
-    
-    def _create_sidebar_layout(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create sidebar layout."""
-        with st.sidebar:
-            # Mode selection if provided
-            if 'modes' in config:
-                selected_mode = st.selectbox(
-                    "Select Mode",
-                    options=config['modes'],
-                    key="mode_selector"
+            # Feature selection
+            with st.expander("Feature Selection"):
+                selected_features = ui_components.create_feature_selection_form(
+                    data.columns.tolist()
                 )
-                
-                # Update state
-                state_manager.set_state('ui.current_mode', selected_mode)
             
-            # Additional sidebar components
-            if 'components' in config:
-                ui_components.create_sidebar(
-                    config.get('title', 'Settings'),
-                    config['components']
-                )
-    
-    def _create_content_layout(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create main content layout."""
-        # Create sections based on configuration
-        for section_config in config.get('sections', []):
-            self._create_section(section_config)
-    
-    def _create_section(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create individual section."""
-        section_type = config['type']
-        
-        if section_type == 'columns':
-            self._create_column_section(config)
-        elif section_type == 'tabs':
-            self._create_tab_section(config)
-        elif section_type == 'expander':
-            self._create_expander_section(config)
+            # Clustering execution
+            if clustering_config and selected_features:
+                if st.button("Run Clustering"):
+                    with st.spinner("Performing clustering analysis..."):
+                        self._execute_clustering(
+                            data,
+                            clustering_config,
+                            selected_features
+                        )
+            
+            # Results visualization
+            if 'clustering_results' in st.session_state:
+                self._display_clustering_results(st.session_state.clustering_results)
         else:
-            # Default to regular section
-            self._create_regular_section(config)
+            st.info("Please upload data to begin clustering analysis")
     
-    def _create_column_section(
+    @monitor_performance
+    def create_metrics_layout(
         self,
-        config: Dict[str, Any]
+        metrics_data: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Create column-based section."""
-        cols = st.columns(config.get('n_columns', 2))
+        """Create metrics visualization layout."""
+        st.header("Performance Metrics")
         
-        for i, col_config in enumerate(config.get('content', [])):
-            with cols[i % len(cols)]:
-                self._create_section(col_config)
-    
-    def _create_tab_section(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create tab-based section."""
-        tabs = st.tabs(config.get('tab_names', []))
-        
-        for i, tab_config in enumerate(config.get('content', [])):
-            with tabs[i]:
-                self._create_section(tab_config)
-    
-    def _create_expander_section(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create expander section."""
-        with st.expander(config.get('title', 'Expander')):
-            for section_config in config.get('content', []):
-                self._create_section(section_config)
-    
-    def _create_regular_section(
-        self,
-        config: Dict[str, Any]
-    ) -> None:
-        """Create regular section."""
-        if 'title' in config:
-            st.subheader(config['title'])
+        if metrics_data is not None:
+            # Overview metrics
+            with st.expander("Overview Metrics", expanded=True):
+                ui_components.display_metrics_overview(metrics_data)
             
-        if 'content' in config:
-            if isinstance(config['content'], str):
-                st.write(config['content'])
-            elif isinstance(config['content'], dict):
-                self._create_section(config['content'])
-            elif isinstance(config['content'], list):
-                for item in config['content']:
-                    self._create_section(item)
+            # Detailed analysis
+            tabs = st.tabs([
+                "Error Analysis",
+                "Distribution Analysis",
+                "Cluster Analysis",
+                "Recommendations"
+            ])
+            
+            with tabs[0]:
+                ui_components.display_error_analysis(metrics_data)
+            
+            with tabs[1]:
+                ui_components.display_distribution_analysis(metrics_data)
+            
+            with tabs[2]:
+                ui_components.display_cluster_analysis(metrics_data)
+            
+            with tabs[3]:
+                ui_components.display_recommendations(metrics_data)
+        else:
+            st.info("No metrics data available")
     
-    def register_section_callback(
+    def _create_statistical_analysis_section(
         self,
-        section_name: str,
-        callback: Callable
+        data: Optional[pd.DataFrame]
     ) -> None:
-        """Register callback for section creation."""
-        self.section_callbacks[section_name] = callback
+        """Create statistical analysis section."""
+        if data is not None:
+            st.subheader("Statistical Analysis")
+            
+            analysis_type = st.selectbox(
+                "Select Analysis Type",
+                ["Descriptive Statistics", "Correlation Analysis", "Distribution Analysis"]
+            )
+            
+            if analysis_type == "Descriptive Statistics":
+                ui_components.display_descriptive_statistics(data)
+            elif analysis_type == "Correlation Analysis":
+                ui_components.display_correlation_analysis(data)
+            else:
+                ui_components.display_distribution_analysis(data)
     
-    def _track_layout(
+    def _create_feature_analysis_section(
+        self,
+        data: Optional[pd.DataFrame]
+    ) -> None:
+        """Create feature analysis section."""
+        if data is not None:
+            st.subheader("Feature Analysis")
+            
+            feature_options = st.multiselect(
+                "Select Features for Analysis",
+                data.columns.tolist()
+            )
+            
+            if feature_options:
+                ui_components.display_feature_analysis(data[feature_options])
+    
+    def _create_clustering_analysis_section(
+        self,
+        data: Optional[pd.DataFrame]
+    ) -> None:
+        """Create clustering analysis section."""
+        if data is not None:
+            st.subheader("Clustering Analysis")
+            
+            # Create clustering configuration form
+            clustering_params = ui_components.create_clustering_config_form()
+            
+            if clustering_params:
+                if st.button("Run Clustering Analysis"):
+                    with st.spinner("Performing clustering..."):
+                        results = self._execute_clustering(data, clustering_params)
+                        ui_components.display_clustering_results(results)
+    
+    def _create_quality_analysis_section(
+        self,
+        data: Optional[pd.DataFrame]
+    ) -> None:
+        """Create quality analysis section."""
+        if data is not None:
+            st.subheader("Data Quality Analysis")
+            
+            quality_metrics = ui_components.analyze_data_quality(data)
+            ui_components.display_quality_metrics(quality_metrics)
+    
+    def _execute_clustering(
+        self,
+        data: pd.DataFrame,
+        config: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute clustering analysis."""
+        # Implement clustering execution logic here
+        pass
+    
+    def _display_clustering_results(
+        self,
+        results: Dict[str, Any]
+    ) -> None:
+        """Display clustering results."""
+        # Implement clustering results display logic here
+        pass
+    
+    def _record_layout(
         self,
         layout_type: str,
         metadata: Dict[str, Any]
     ) -> None:
-        """Track layout creation."""
+        """Record layout creation."""
         layout_id = f"{layout_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         self.active_layouts[layout_id] = {

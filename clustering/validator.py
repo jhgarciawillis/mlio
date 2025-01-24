@@ -9,6 +9,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import KFold
 from scipy.stats import f_oneway
+import plotly.graph_objects as go
 
 from core import config
 from core.exceptions import ClusterValidationError
@@ -34,6 +35,13 @@ class ClusterValidator:
     ) -> Dict[str, Any]:
         """Perform comprehensive cluster validation."""
         try:
+            # Record operation start
+            state_monitor.record_operation_start(
+                'cluster_validation',
+                'validation',
+                {'n_clusters': len(np.unique(labels))}
+            )
+            
             validation_id = f"validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
             if validation_config is None:
@@ -83,9 +91,21 @@ class ClusterValidator:
             # Record validation
             self._record_validation(validation_id, validation_config)
             
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'cluster_validation',
+                'completed',
+                {'validation_id': validation_id}
+            )
+            
             return results
             
         except Exception as e:
+            state_monitor.record_operation_end(
+                'cluster_validation',
+                'failed',
+                {'error': str(e)}
+            )
             raise ClusterValidationError(
                 f"Error validating clustering: {str(e)}"
             ) from e
@@ -140,7 +160,8 @@ class ClusterValidator:
         """Analyze clustering stability."""
         stability_results = {
             'fold_metrics': [],
-            'label_consistency': {}
+            'label_consistency': {},
+            'cluster_persistence': {}
         }
         
         kf = KFold(
@@ -149,6 +170,7 @@ class ClusterValidator:
             random_state=config.random_state
         )
         
+        # Analyze across folds
         for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
             train_data = data.iloc[train_idx]
             val_data = data.iloc[val_idx]
@@ -171,14 +193,21 @@ class ClusterValidator:
                 if label not in stability_results['label_consistency']:
                     stability_results['label_consistency'][label] = []
                 
-                label_mask = train_labels == label
-                if label_mask.any():
-                    consistency = self._calculate_label_consistency(
-                        train_data[label_mask],
-                        val_data,
-                        val_labels
-                    )
-                    stability_results['label_consistency'][label].append(consistency)
+                consistency = self._calculate_label_consistency(
+                    train_data[train_labels == label],
+                    val_data,
+                    val_labels
+                )
+                stability_results['label_consistency'][label].append(consistency)
+        
+        # Calculate cluster persistence
+        for label in np.unique(labels):
+            mask = labels == label
+            persistence = self._calculate_cluster_persistence(
+                data[mask],
+                n_splits
+            )
+            stability_results['cluster_persistence'][int(label)] = persistence
         
         # Calculate stability statistics
         stability_results['statistics'] = self._calculate_stability_statistics(
@@ -196,14 +225,14 @@ class ClusterValidator:
         """Analyze feature importance and distributions."""
         feature_analysis = {
             'importance': {},
-            'distributions': {}
+            'distributions': {},
+            'discriminative_power': {}
         }
         
-        # Calculate feature importance
+        # Calculate feature importance using ANOVA F-value
         for column in data.columns:
-            f_stat, p_value = f_oneway(
-                *[group[column].values for _, group in data.groupby(labels)]
-            )
+            groups = [group[column].values for _, group in data.groupby(labels)]
+            f_stat, p_value = f_oneway(*groups)
             feature_analysis['importance'][column] = {
                 'f_statistic': float(f_stat),
                 'p_value': float(p_value)
@@ -214,13 +243,19 @@ class ClusterValidator:
             feature_analysis['distributions'][column] = {}
             for label in np.unique(labels):
                 cluster_data = data[labels == label][column]
-                feature_analysis['distributions'][column][label] = {
+                feature_analysis['distributions'][column][int(label)] = {
                     'mean': float(cluster_data.mean()),
                     'std': float(cluster_data.std()),
                     'median': float(cluster_data.median()),
                     'q25': float(cluster_data.quantile(0.25)),
                     'q75': float(cluster_data.quantile(0.75))
                 }
+        
+        # Calculate discriminative power
+        feature_analysis['discriminative_power'] = self._calculate_discriminative_power(
+            data,
+            labels
+        )
         
         return feature_analysis
     
@@ -237,21 +272,23 @@ class ClusterValidator:
             cluster_data = data[labels == label]
             
             # Basic statistics
-            characteristics[label] = {
+            characteristics[int(label)] = {
                 'size': int(len(cluster_data)),
                 'proportion': float(len(cluster_data) / len(data)),
                 'density': self._calculate_cluster_density(cluster_data),
+                'compactness': self._calculate_cluster_compactness(cluster_data),
                 'features': {}
             }
             
             # Feature-level statistics
             for column in data.columns:
-                characteristics[label]['features'][column] = {
+                characteristics[int(label)]['features'][column] = {
                     'mean': float(cluster_data[column].mean()),
                     'std': float(cluster_data[column].std()),
                     'min': float(cluster_data[column].min()),
                     'max': float(cluster_data[column].max()),
-                    'unique_values': int(cluster_data[column].nunique())
+                    'unique_values': int(cluster_data[column].nunique()),
+                    'completeness': float(cluster_data[column].notna().mean())
                 }
         
         return characteristics
@@ -260,7 +297,7 @@ class ClusterValidator:
         self,
         data: pd.DataFrame,
         labels: np.ndarray
-    ) -> Dict[int, float]:
+    ) -> Dict[str, float]:
         """Calculate average intra-cluster distances."""
         distances = {}
         
@@ -279,7 +316,7 @@ class ClusterValidator:
         
         return distances
     
-    def _calculate_inter_cluster_distances(
+def _calculate_inter_cluster_distances(
         self,
         data: pd.DataFrame,
         labels: np.ndarray
@@ -324,19 +361,99 @@ class ClusterValidator:
         
         return float(np.mean(nearest_labels == most_common_label))
     
-    def _calculate_cluster_density(
+    def _calculate_cluster_persistence(
         self,
-        cluster_data: pd.DataFrame
+        cluster_data: pd.DataFrame,
+        n_splits: int
     ) -> float:
-        """Calculate cluster density."""
-        if len(cluster_data) <= 1:
-            return 0.0
-            
-        # Calculate average distance to centroid
-        centroid = cluster_data.mean().values
-        distances = np.linalg.norm(cluster_data - centroid, axis=1)
+        """Calculate cluster persistence across splits."""
+        persistence_scores = []
         
-        return float(1 / (np.mean(distances) + 1e-10))
+        for _ in range(n_splits):
+            # Random split
+            mask = np.random.choice(
+                [True, False],
+                size=len(cluster_data),
+                p=[0.5, 0.5]
+            )
+            
+            if np.sum(mask) > 0 and np.sum(~mask) > 0:
+                split1 = cluster_data[mask]
+                split2 = cluster_data[~mask]
+                
+                # Calculate centroids
+                centroid1 = split1.mean()
+                centroid2 = split2.mean()
+                
+                # Calculate similarity between splits
+                similarity = 1 / (1 + np.linalg.norm(centroid1 - centroid2))
+                persistence_scores.append(similarity)
+        
+        return float(np.mean(persistence_scores)) if persistence_scores else 0.0
+    
+    def _calculate_discriminative_power(
+        self,
+        data: pd.DataFrame,
+        labels: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate discriminative power of features."""
+        discriminative_power = {}
+        
+        for column in data.columns:
+            # Calculate ratio of between-cluster to within-cluster variance
+            cluster_means = [
+                data[labels == label][column].mean()
+                for label in np.unique(labels)
+            ]
+            
+            total_mean = data[column].mean()
+            
+            between_cluster_var = np.sum([
+                len(data[labels == label]) * (mean - total_mean) ** 2
+                for label, mean in zip(np.unique(labels), cluster_means)
+            ]) / len(data)
+            
+            within_cluster_var = np.mean([
+                data[labels == label][column].var()
+                for label in np.unique(labels)
+                if len(data[labels == label]) > 1
+            ])
+            
+            if within_cluster_var > 0:
+                discriminative_power[column] = float(
+                    between_cluster_var / within_cluster_var
+                )
+            else:
+                discriminative_power[column] = float('inf')
+        
+        return discriminative_power
+    
+    def _calculate_stability_statistics(
+        self,
+        stability_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Calculate stability statistics."""
+        stats = {
+            'mean_consistency': {},
+            'consistency_std': {},
+            'mean_persistence': float(np.mean(list(
+                stability_results['cluster_persistence'].values()
+            ))),
+            'fold_stability': {}
+        }
+        
+        # Calculate consistency statistics
+        for label, consistencies in stability_results['label_consistency'].items():
+            stats['mean_consistency'][int(label)] = float(np.mean(consistencies))
+            stats['consistency_std'][int(label)] = float(np.std(consistencies))
+        
+        # Calculate fold stability
+        for fold_result in stability_results['fold_metrics']:
+            metrics = fold_result['metrics']
+            fold = fold_result['fold']
+            stats['fold_stability'][fold] = float(metrics.get('silhouette', 0))
+        
+        return stats
     
     def _create_validation_visualizations(
         self,
@@ -349,12 +466,7 @@ class ClusterValidator:
         
         # Silhouette plot
         if 'internal' in results and results['internal'].get('silhouette') is not None:
-            visualizations['silhouette'] = plotter.create_plot(
-                'silhouette',
-                data=data,
-                labels=labels,
-                title='Silhouette Analysis'
-            )
+            visualizations['silhouette'] = self._create_silhouette_plot(data, labels)
         
         # Feature importance plot
         if 'feature_analysis' in results:
@@ -368,19 +480,31 @@ class ClusterValidator:
             
             visualizations['feature_importance'] = plotter.create_plot(
                 'bar',
-                data=importance_df,
+                data=importance_df.sort_values('importance', ascending=False),
                 x='feature',
                 y='importance',
                 title='Feature Importance (-log10 p-value)'
             )
         
-        # Cluster characteristics plot
+        # Stability plot
+        if 'stability' in results:
+            stability_df = pd.DataFrame({
+                'Cluster': list(results['stability']['cluster_persistence'].keys()),
+                'Persistence': list(results['stability']['cluster_persistence'].values())
+            })
+            
+            visualizations['stability'] = plotter.create_plot(
+                'bar',
+                data=stability_df,
+                x='Cluster',
+                y='Persistence',
+                title='Cluster Stability'
+            )
+        
+        # Characteristics plot
         if 'characteristics' in results:
-            visualizations['cluster_characteristics'] = plotter.create_plot(
-                'scatter',
-                data=data,
-                labels=labels,
-                title='Cluster Characteristics'
+            visualizations['characteristics'] = self._create_characteristics_plot(
+                results['characteristics']
             )
         
         return visualizations

@@ -1,10 +1,10 @@
 from typing import Dict, List, Optional, Any, Union, Tuple
 from dataclasses import dataclass, field
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
-import json
 import colorsys
+import json
+from pathlib import Path
+from datetime import datetime
 
 from core import config
 from core.exceptions import VisualizationError
@@ -247,7 +247,7 @@ class StyleManager:
     ) -> None:
         """Record style change in history."""
         record = {
-            'timestamp': pd.Timestamp.now().isoformat(),
+            'timestamp': datetime.now().isoformat(),
             'type': change_type,
             'details': details
         }

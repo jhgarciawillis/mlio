@@ -1,11 +1,10 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Any, Union, Tuple
-from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import plotly.figure_factory as ff
+from datetime import datetime
 
 from core import config
 from core.exceptions import VisualizationError
@@ -20,10 +19,8 @@ class Plotter:
     def __init__(self):
         self.plot_history: List[Dict[str, Any]] = []
         self.figures: Dict[str, go.Figure] = {}
-        self.default_height = config.ui.chart_height
-        self.default_width = config.ui.chart_width
         
-        # Mapping of plot types to creation methods
+        # Plot type mappings
         self.plot_types = {
             'scatter': self._create_scatter_plot,
             'line': self._create_line_plot,
@@ -36,16 +33,14 @@ class Plotter:
             'density': self._create_density_plot,
             'scatter_matrix': self._create_scatter_matrix,
             'parallel_coordinates': self._create_parallel_coordinates,
-            # Metrics visualization types
-            'metric_comparison': self._create_metric_comparison_plot,
-            'residual_plot': self._create_residual_plot,
-            'learning_curve': self._create_learning_curve_plot,
-            'validation_curve': self._create_validation_curve_plot,
+            
+            # Specialized plots
+            'silhouette': self._create_silhouette_plot,
+            'cluster_map': self._create_cluster_map,
             'feature_importance': self._create_feature_importance_plot,
-            'confusion_matrix': self._create_confusion_matrix_plot,
-            'roc_curve': self._create_roc_curve_plot,
-            'pr_curve': self._create_pr_curve_plot,
-            'calibration_curve': self._create_calibration_curve_plot
+            'residuals': self._create_residual_plot,
+            'qq': self._create_qq_plot,
+            'learning_curve': self._create_learning_curve_plot
         }
     
     @monitor_performance
@@ -57,28 +52,50 @@ class Plotter:
         **kwargs
     ) -> go.Figure:
         """Create plot based on type."""
-        if plot_type not in self.plot_types:
-            raise VisualizationError(f"Unsupported plot type: {plot_type}")
-        
-        # Add default styling
-        kwargs.setdefault('height', self.default_height)
-        kwargs.setdefault('width', self.default_width)
-        kwargs.setdefault('template', 'plotly_white')
-        
-        # Create plot
-        fig = self.plot_types[plot_type](data, **kwargs)
-        
-        # Apply theme
-        fig = style_manager.apply_theme_to_figure(fig)
-        
-        # Store plot
-        plot_id = f"plot_{len(self.plot_history)}"
-        self.figures[plot_id] = fig
-        
-        # Record plot creation
-        self._record_plot(plot_type, kwargs)
-        
-        return fig
+        try:
+            # Record operation start
+            state_monitor.record_operation_start(
+                'plot_creation',
+                'visualization',
+                {'plot_type': plot_type}
+            )
+            
+            # Validate plot type
+            if plot_type not in self.plot_types:
+                raise VisualizationError(
+                    f"Unsupported plot type: {plot_type}",
+                    details={'available_types': list(self.plot_types.keys())}
+                )
+            
+            # Create plot
+            fig = self.plot_types[plot_type](data, **kwargs)
+            
+            # Apply theme
+            fig = style_manager.apply_theme_to_figure(fig)
+            
+            # Store figure
+            plot_id = f"plot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.figures[plot_id] = fig
+            
+            # Record operation completion
+            state_monitor.record_operation_end(
+                'plot_creation',
+                'completed',
+                {'plot_id': plot_id}
+            )
+            
+            # Record plot creation
+            self._record_plot(plot_type, plot_id, kwargs)
+            
+            return fig
+            
+        except Exception as e:
+            state_monitor.record_operation_end(
+                'plot_creation',
+                'failed',
+                {'error': str(e)}
+            )
+            raise VisualizationError(f"Error creating plot: {str(e)}") from e
     
     @monitor_performance
     def _create_scatter_plot(
@@ -108,13 +125,14 @@ class Plotter:
         )
         
         return fig
-    
-    @monitor_performance
+
+@monitor_performance
     def _create_line_plot(
         self,
         data: pd.DataFrame,
         x: str,
         y: Union[str, List[str]],
+        color: Optional[str] = None,
         title: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
@@ -123,13 +141,14 @@ class Plotter:
             data,
             x=x,
             y=y,
+            color=color,
             title=title,
             **kwargs
         )
         
         fig.update_layout(
             title_x=0.5,
-            showlegend=True
+            showlegend=True if color else False
         )
         
         return fig
@@ -192,8 +211,9 @@ class Plotter:
     def _create_box_plot(
         self,
         data: pd.DataFrame,
-        y: str,
         x: Optional[str] = None,
+        y: str = None,
+        color: Optional[str] = None,
         title: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
@@ -202,52 +222,7 @@ class Plotter:
             data,
             x=x,
             y=y,
-            title=title,
-            **kwargs
-        )
-        
-        fig.update_layout(
-            title_x=0.5,
-            showlegend=True if x else False
-        )
-        
-        return fig
-    
-    @monitor_performance
-    def _create_violin_plot(
-        self,
-        data: pd.DataFrame,
-        y: str,
-        x: Optional[str] = None,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create violin plot."""
-        fig = px.violin(
-            data,
-            x=x,
-            y=y,
-            title=title,
-            **kwargs
-        )
-        
-        fig.update_layout(
-            title_x=0.5,
-            showlegend=True if x else False
-        )
-        
-        return fig
-    
-    @monitor_performance
-    def _create_heatmap_plot(
-        self,
-        data: pd.DataFrame,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create heatmap plot."""
-        fig = px.imshow(
-            data,
+            color=color,
             title=title,
             **kwargs
         )
@@ -259,77 +234,162 @@ class Plotter:
         return fig
     
     @monitor_performance
-    def _create_pie_plot(
+    def _create_violin_plot(
         self,
         data: pd.DataFrame,
-        values: str,
-        names: str,
+        x: Optional[str] = None,
+        y: str = None,
+        color: Optional[str] = None,
         title: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
-        """Create pie plot."""
-        fig = px.pie(
+        """Create violin plot."""
+        fig = px.violin(
             data,
-            values=values,
-            names=names,
+            x=x,
+            y=y,
+            color=color,
             title=title,
             **kwargs
         )
         
         fig.update_layout(
-            title_x=0.5,
-            showlegend=True
+            title_x=0.5
         )
         
         return fig
     
     @monitor_performance
-    def _create_density_plot(
+    def _create_heatmap_plot(
         self,
         data: pd.DataFrame,
-        x: str,
         title: Optional[str] = None,
+        colorscale: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
-        """Create density plot."""
-        fig = ff.create_distplot(
-            [data[x].dropna()],
-            [x],
-            show_hist=False,
-            show_rug=False
+        """Create heatmap plot."""
+        fig = px.imshow(
+            data,
+            title=title,
+            color_continuous_scale=colorscale or 'RdBu_r',
+            **kwargs
         )
         
         fig.update_layout(
-            title=title,
-            title_x=0.5,
-            showlegend=False,
-            **kwargs
+            title_x=0.5
         )
         
         return fig
     
-    # Metric Visualization Methods (from metrics/visualizer.py)
     @monitor_performance
-    def _create_metric_comparison_plot(
+    def _create_silhouette_plot(
         self,
-        metrics: Dict[str, float],
+        data: np.ndarray,
+        labels: np.ndarray,
         title: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
-        """Create metric comparison plot."""
-        fig = px.bar(
-            pd.DataFrame({
-                'Metric': list(metrics.keys()),
-                'Value': list(metrics.values())
-            }),
-            x='Metric',
-            y='Value',
-            title=title or 'Metric Comparison'
-        )
+        """Create silhouette plot."""
+        from sklearn.metrics import silhouette_samples
+        
+        # Calculate silhouette scores
+        silhouette_vals = silhouette_samples(data, labels)
+        
+        # Create figure
+        fig = go.Figure()
+        
+        y_lower = 10
+        for i in range(len(np.unique(labels))):
+            cluster_silhouette_vals = silhouette_vals[labels == i]
+            cluster_silhouette_vals.sort()
+            
+            size_cluster = len(cluster_silhouette_vals)
+            y_upper = y_lower + size_cluster
+            
+            fig.add_trace(go.Scatter(
+                x=cluster_silhouette_vals,
+                y=np.arange(y_lower, y_upper),
+                name=f'Cluster {i}',
+                mode='lines',
+                showlegend=True
+            ))
+            
+            y_lower = y_upper + 10
         
         fig.update_layout(
+            title=title or 'Silhouette Plot',
             title_x=0.5,
-            bargap=0.2
+            xaxis_title='Silhouette Coefficient',
+            yaxis_title='Cluster'
+        )
+        
+        return fig
+    
+    @monitor_performance
+    def _create_cluster_map(
+        self,
+        data: pd.DataFrame,
+        labels: np.ndarray,
+        title: Optional[str] = None,
+        **kwargs
+    ) -> go.Figure:
+        """Create cluster map visualization."""
+        # Perform dimensionality reduction if needed
+        if data.shape[1] > 2:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2)
+            coords = pca.fit_transform(data)
+        else:
+            coords = data.values
+        
+        # Create scatter plot
+        fig = go.Figure()
+        
+        for label in np.unique(labels):
+            mask = labels == label
+            fig.add_trace(go.Scatter(
+                x=coords[mask, 0],
+                y=coords[mask, 1],
+                mode='markers',
+                name=f'Cluster {label}',
+                marker=dict(size=8)
+            ))
+        
+        fig.update_layout(
+            title=title or 'Cluster Map',
+            title_x=0.5,
+            xaxis_title='Component 1',
+            yaxis_title='Component 2'
+        )
+        
+        return fig
+    
+@monitor_performance
+    def _create_feature_importance_plot(
+        self,
+        feature_names: List[str],
+        importance_values: np.ndarray,
+        title: Optional[str] = None,
+        **kwargs
+    ) -> go.Figure:
+        """Create feature importance visualization."""
+        # Sort features by importance
+        sorted_idx = np.argsort(importance_values)
+        pos = np.arange(sorted_idx.shape[0]) + .5
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Bar(
+            x=importance_values[sorted_idx],
+            y=[feature_names[i] for i in sorted_idx],
+            orientation='h'
+        ))
+        
+        fig.update_layout(
+            title=title or 'Feature Importance',
+            title_x=0.5,
+            xaxis_title='Importance Score',
+            yaxis_title='Feature'
         )
         
         return fig
@@ -345,20 +405,79 @@ class Plotter:
         """Create residual plot."""
         residuals = y_true - y_pred
         
-        fig = px.scatter(
-            pd.DataFrame({
-                'Predicted': y_pred,
-                'Residuals': residuals
-            }),
-            x='Predicted',
-            y='Residuals',
-            title=title or 'Residual Plot'
+        fig = make_subplots(rows=2, cols=1)
+        
+        # Scatter plot of residuals vs predicted
+        fig.add_trace(
+            go.Scatter(
+                x=y_pred,
+                y=residuals,
+                mode='markers',
+                name='Residuals'
+            ),
+            row=1, col=1
         )
         
-        fig.add_hline(y=0, line_dash="dash", line_color="red")
+        # Histogram of residuals
+        fig.add_trace(
+            go.Histogram(
+                x=residuals,
+                name='Residual Distribution'
+            ),
+            row=2, col=1
+        )
         
         fig.update_layout(
-            title_x=0.5
+            title=title or 'Residual Analysis',
+            title_x=0.5,
+            showlegend=True
+        )
+        
+        fig.update_xaxes(title_text='Predicted Values', row=1, col=1)
+        fig.update_xaxes(title_text='Residuals', row=2, col=1)
+        fig.update_yaxes(title_text='Residuals', row=1, col=1)
+        fig.update_yaxes(title_text='Frequency', row=2, col=1)
+        
+        return fig
+    
+    @monitor_performance
+    def _create_qq_plot(
+        self,
+        data: np.ndarray,
+        title: Optional[str] = None,
+        **kwargs
+    ) -> go.Figure:
+        """Create Q-Q plot."""
+        sorted_data = np.sort(data)
+        theoretical_quantiles = stats.norm.ppf(
+            np.linspace(0.01, 0.99, len(sorted_data))
+        )
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=theoretical_quantiles,
+            y=sorted_data,
+            mode='markers',
+            name='Q-Q Plot'
+        ))
+        
+        # Add diagonal line
+        min_val = min(theoretical_quantiles.min(), sorted_data.min())
+        max_val = max(theoretical_quantiles.max(), sorted_data.max())
+        fig.add_trace(go.Scatter(
+            x=[min_val, max_val],
+            y=[min_val, max_val],
+            mode='lines',
+            name='Reference Line',
+            line=dict(dash='dash')
+        ))
+        
+        fig.update_layout(
+            title=title or 'Q-Q Plot',
+            title_x=0.5,
+            xaxis_title='Theoretical Quantiles',
+            yaxis_title='Sample Quantiles'
         )
         
         return fig
@@ -372,253 +491,53 @@ class Plotter:
         title: Optional[str] = None,
         **kwargs
     ) -> go.Figure:
-        """Create learning curve plot."""
+        """Create learning curve visualization."""
         fig = go.Figure()
         
         fig.add_trace(go.Scatter(
             x=train_sizes,
-            y=train_scores.mean(axis=1),
+            y=np.mean(train_scores, axis=1),
             mode='lines+markers',
             name='Training Score',
             error_y=dict(
                 type='data',
-                array=train_scores.std(axis=1),
+                array=np.std(train_scores, axis=1),
                 visible=True
             )
         ))
         
         fig.add_trace(go.Scatter(
             x=train_sizes,
-            y=val_scores.mean(axis=1),
+            y=np.mean(val_scores, axis=1),
             mode='lines+markers',
             name='Validation Score',
             error_y=dict(
                 type='data',
-                array=val_scores.std(axis=1),
+                array=np.std(val_scores, axis=1),
                 visible=True
             )
         ))
         
         fig.update_layout(
-            title=title or 'Learning Curves',
+            title=title or 'Learning Curve',
             title_x=0.5,
-            xaxis_title="Training Examples",
-            yaxis_title="Score"
+            xaxis_title='Training Examples',
+            yaxis_title='Score'
         )
         
         return fig
     
-    @monitor_performance
-    def _create_validation_curve_plot(
-        self,
-        param_range: np.ndarray,
-        train_scores: np.ndarray,
-        val_scores: np.ndarray,
-        param_name: str,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create validation curve plot."""
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=param_range,
-            y=train_scores.mean(axis=1),
-            mode='lines+markers',
-            name='Training Score',
-            error_y=dict(
-                type='data',
-                array=train_scores.std(axis=1),
-                visible=True
-            )
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=param_range,
-            y=val_scores.mean(axis=1),
-            mode='lines+markers',
-            name='Validation Score',
-            error_y=dict(
-                type='data',
-                array=val_scores.std(axis=1),
-                visible=True
-            )
-        ))
-        
-        fig.update_layout(
-            title=title or f'Validation Curve ({param_name})',
-            title_x=0.5,
-            xaxis_title=param_name,
-            yaxis_title="Score"
-        )
-        
-        return fig
-    
-    @monitor_performance
-    def _create_feature_importance_plot(
-        self,
-        feature_names: List[str],
-        importance_values: np.ndarray,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create feature importance plot."""
-        fig = px.bar(
-            pd.DataFrame({
-                'Feature': feature_names,
-                'Importance': importance_values
-            }).sort_values('Importance', ascending=True),
-            x='Importance',
-            y='Feature',
-            orientation='h',
-            title=title or 'Feature Importance'
-        )
-        
-        fig.update_layout(
-            title_x=0.5
-        )
-        
-        return fig
-    
-    @monitor_performance
-    def _create_confusion_matrix_plot(
-        self,
-        confusion_matrix: np.ndarray,
-        labels: Optional[List[str]] = None,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create confusion matrix plot."""
-        fig = px.imshow(
-            confusion_matrix,
-            labels=dict(
-                x="Predicted",
-                y="True",
-                color="Count"
-            ),
-            x=labels,
-            y=labels,
-            title=title or 'Confusion Matrix'
-        )
-        
-        fig.update_layout(
-            title_x=0.5
-        )
-        
-        return fig
-    
-    @monitor_performance
-    def _create_roc_curve_plot(
-        self,
-        fpr: np.ndarray,
-        tpr: np.ndarray,
-        auc_score: float,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create ROC curve plot."""
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=fpr,
-            y=tpr,
-            mode='lines',
-            name=f'ROC curve (AUC = {auc_score:.3f})'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=[0, 1],
-            y=[0, 1],
-            mode='lines',
-            line=dict(dash='dash'),
-            name='Random'
-        ))
-        
-        fig.update_layout(
-            title=title or 'ROC Curve',
-            title_x=0.5,
-            xaxis_title='False Positive Rate',
-            yaxis_title='True Positive Rate'
-        )
-        
-        return fig
-
-    @monitor_performance
-    def _create_pr_curve_plot(
-        self,
-        precision: np.ndarray,
-        recall: np.ndarray,
-        average_precision: float,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create precision-recall curve plot."""
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=recall,
-            y=precision,
-            mode='lines',
-            name=f'PR curve (AP = {average_precision:.3f})'
-        ))
-        
-        fig.update_layout(
-            title=title or 'Precision-Recall Curve',
-            title_x=0.5,
-            xaxis_title='Recall',
-            yaxis_title='Precision',
-            yaxis=dict(range=[0, 1.05]),
-            xaxis=dict(range=[0, 1.05])
-        )
-        
-        return fig
-
-    @monitor_performance
-    def _create_calibration_curve_plot(
-        self,
-        prob_true: np.ndarray,
-        prob_pred: np.ndarray,
-        title: Optional[str] = None,
-        **kwargs
-    ) -> go.Figure:
-        """Create calibration curve plot."""
-        fig = go.Figure()
-        
-        fig.add_trace(go.Scatter(
-            x=prob_pred,
-            y=prob_true,
-            mode='lines',
-            name='Calibration curve'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=[0, 1],
-            y=[0, 1],
-            mode='lines',
-            line=dict(dash='dash'),
-            name='Perfect calibration'
-        ))
-        
-        fig.update_layout(
-            title=title or 'Calibration Curve',
-            title_x=0.5,
-            xaxis_title='Mean predicted probability',
-            yaxis_title='Fraction of positives',
-            yaxis=dict(range=[0, 1.05]),
-            xaxis=dict(range=[0, 1.05])
-        )
-        
-        return fig
-
     def _record_plot(
         self,
         plot_type: str,
+        plot_id: str,
         plot_args: Dict[str, Any]
     ) -> None:
         """Record plot creation in history."""
         record = {
-            'timestamp': pd.Timestamp.now().isoformat(),
+            'timestamp': datetime.now().isoformat(),
             'plot_type': plot_type,
+            'plot_id': plot_id,
             'arguments': plot_args
         }
         
@@ -627,7 +546,7 @@ class Plotter:
             f'visualization.history.{len(self.plot_history)}',
             record
         )
-
+    
     @monitor_performance
     def save_plot(
         self,
@@ -654,42 +573,19 @@ class Plotter:
                 f"Error saving plot: {str(e)}",
                 details={'path': str(path), 'format': format}
             ) from e
-
+    
     @monitor_performance
-    def load_plot(
+    def get_plot_history(
         self,
-        path: Path
-    ) -> go.Figure:
-        """Load plot from file."""
-        try:
-            if not path.exists():
-                raise VisualizationError(f"Plot file not found: {path}")
-            
-            if path.suffix == '.html':
-                fig = go.Figure(px.load_figure(path))
-            elif path.suffix == '.json':
-                with open(path, 'r') as f:
-                    fig = go.Figure(json.load(f))
-            else:
-                raise VisualizationError(f"Unsupported file format: {path.suffix}")
-            
-            return fig
-            
-        except Exception as e:
-            raise VisualizationError(
-                f"Error loading plot: {str(e)}",
-                details={'path': str(path)}
-            ) from e
-
-    def get_plot_summary(self) -> Dict[str, Any]:
-        """Get summary of plot creation history."""
-        return {
-            'total_plots': len(self.plot_history),
-            'plot_types': list(set(
-                record['plot_type'] for record in self.plot_history
-            )),
-            'recent_plots': self.plot_history[-5:]
-        }
+        plot_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get plot creation history."""
+        if plot_type:
+            return [
+                record for record in self.plot_history
+                if record['plot_type'] == plot_type
+            ]
+        return self.plot_history
 
 # Create global plotter instance
 plotter = Plotter()

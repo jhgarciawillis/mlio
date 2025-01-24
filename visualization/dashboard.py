@@ -1,10 +1,8 @@
-import pandas as pd
-import numpy as np
+import streamlit as st
 from typing import Dict, List, Optional, Any, Union, Tuple
 from pathlib import Path
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import streamlit as st
+from datetime import datetime
 
 from core import config
 from core.exceptions import VisualizationError
@@ -21,6 +19,31 @@ class DashboardManager:
         self.layouts: Dict[str, Dict[str, Any]] = {}
         self.current_dashboard: Optional[str] = None
         self.dashboard_history: List[Dict[str, Any]] = []
+        
+        # Layout templates
+        self.layout_templates = {
+            'default': {
+                'rows': 2,
+                'columns': 2,
+                'height': 600,
+                'width': 800,
+                'spacing': 0.1
+            },
+            'wide': {
+                'rows': 1,
+                'columns': 3,
+                'height': 400,
+                'width': 1200,
+                'spacing': 0.05
+            },
+            'tall': {
+                'rows': 3,
+                'columns': 1,
+                'height': 800,
+                'width': 600,
+                'spacing': 0.1
+            }
+        }
     
     @monitor_performance
     @handle_exceptions(VisualizationError)
@@ -34,19 +57,33 @@ class DashboardManager:
         if name in self.dashboards:
             raise VisualizationError(f"Dashboard already exists: {name}")
         
+        # Record operation start
+        state_monitor.record_operation_start(
+            'dashboard_creation',
+            'visualization',
+            {'name': name}
+        )
+        
         dashboard = {
             'title': title,
-            'layout': layout or self._get_default_layout(),
+            'layout': layout or self.layout_templates['default'].copy(),
             'plots': {},
             'filters': {},
             'metadata': {
-                'created_at': pd.Timestamp.now().isoformat(),
-                'last_updated': pd.Timestamp.now().isoformat()
+                'created_at': datetime.now().isoformat(),
+                'last_updated': datetime.now().isoformat()
             }
         }
         
         self.dashboards[name] = dashboard
         self.current_dashboard = name
+        
+        # Record operation completion
+        state_monitor.record_operation_end(
+            'dashboard_creation',
+            'completed',
+            {'dashboard_name': name}
+        )
         
         self._record_dashboard_action('creation', name)
     
@@ -78,7 +115,7 @@ class DashboardManager:
             'kwargs': plot_kwargs
         }
         
-        dashboard['metadata']['last_updated'] = pd.Timestamp.now().isoformat()
+        dashboard['metadata']['last_updated'] = datetime.now().isoformat()
         
         self._record_dashboard_action('plot_addition', plot_name)
     
@@ -104,47 +141,11 @@ class DashboardManager:
             'value': default
         }
         
-        dashboard['metadata']['last_updated'] = pd.Timestamp.now().isoformat()
+        dashboard['metadata']['last_updated'] = datetime.now().isoformat()
         
         self._record_dashboard_action('filter_addition', filter_name)
     
-    @monitor_performance
-    def update_plot(
-        self,
-        plot_name: str,
-        data: Any,
-        **plot_kwargs
-    ) -> None:
-        """Update existing plot in dashboard."""
-        if self.current_dashboard is None:
-            raise VisualizationError("No active dashboard")
-        
-        dashboard = self.dashboards[self.current_dashboard]
-        if plot_name not in dashboard['plots']:
-            raise VisualizationError(f"Plot not found: {plot_name}")
-        
-        plot_info = dashboard['plots'][plot_name]
-        
-        # Create updated plot
-        fig = plotter.create_plot(
-            plot_info['type'],
-            data,
-            **(plot_kwargs or plot_info['kwargs'])
-        )
-        
-        # Apply theme
-        fig = style_manager.apply_theme_to_figure(fig)
-        
-        # Update dashboard
-        plot_info['figure'] = fig
-        if plot_kwargs:
-            plot_info['kwargs'].update(plot_kwargs)
-        
-        dashboard['metadata']['last_updated'] = pd.Timestamp.now().isoformat()
-        
-        self._record_dashboard_action('plot_update', plot_name)
-    
-    @monitor_performance
+@monitor_performance
     def render_dashboard(
         self,
         dashboard_name: Optional[str] = None
@@ -161,8 +162,8 @@ class DashboardManager:
         
         # Create layout
         layout = dashboard['layout']
-        num_rows = layout.get('rows', 2)
-        num_cols = layout.get('columns', 2)
+        num_rows = layout['rows']
+        num_cols = layout['columns']
         
         # Render filters
         if dashboard['filters']:
@@ -230,14 +231,6 @@ class DashboardManager:
         
         return filter_values
     
-    def _get_default_layout(self) -> Dict[str, Any]:
-        """Get default dashboard layout."""
-        return {
-            'rows': 2,
-            'columns': 2,
-            'spacing': 0.1
-        }
-    
     def _get_next_position(self) -> Dict[str, int]:
         """Get next available position in dashboard grid."""
         if self.current_dashboard is None:
@@ -271,24 +264,22 @@ class DashboardManager:
         dashboard = self.dashboards[self.current_dashboard]
         return {'order': len(dashboard['filters'])}
     
-    def _record_dashboard_action(
+    @monitor_performance
+    def update_layout(
         self,
-        action_type: str,
-        target: str
+        layout_config: Dict[str, Any],
+        dashboard_name: Optional[str] = None
     ) -> None:
-        """Record dashboard action in history."""
-        record = {
-            'timestamp': pd.Timestamp.now().isoformat(),
-            'action': action_type,
-            'target': target,
-            'dashboard': self.current_dashboard
-        }
+        """Update dashboard layout configuration."""
+        name = dashboard_name or self.current_dashboard
+        if name is None:
+            raise VisualizationError("No dashboard specified")
         
-        self.dashboard_history.append(record)
-        state_manager.set_state(
-            f'visualization.dashboard_history.{len(self.dashboard_history)}',
-            record
-        )
+        dashboard = self.dashboards[name]
+        dashboard['layout'].update(layout_config)
+        dashboard['metadata']['last_updated'] = datetime.now().isoformat()
+        
+        self._record_dashboard_action('layout_update', name)
     
     @monitor_performance
     def save_dashboard(
@@ -372,6 +363,25 @@ class DashboardManager:
         self.dashboards[name]['metadata'] = dashboard_config['metadata']
         
         logger.info(f"Dashboard loaded from {path}")
+    
+    def _record_dashboard_action(
+        self,
+        action_type: str,
+        target: str
+    ) -> None:
+        """Record dashboard action in history."""
+        record = {
+            'timestamp': datetime.now().isoformat(),
+            'action': action_type,
+            'target': target,
+            'dashboard': self.current_dashboard
+        }
+        
+        self.dashboard_history.append(record)
+        state_manager.set_state(
+            f'visualization.dashboard_history.{len(self.dashboard_history)}',
+            record
+        )
 
 # Create global dashboard manager instance
 dashboard_manager = DashboardManager()

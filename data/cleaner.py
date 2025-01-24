@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Any, Union, Set, Tuple
+from typing import Dict, List, Optional, Any, Union, Tuple
 from pathlib import Path
 from datetime import datetime
 import re
@@ -19,6 +19,18 @@ class DataCleaner:
         self.cleaning_stats: Dict[str, Dict[str, Any]] = {}
         self.original_data: Optional[pd.DataFrame] = None
         self.cleaned_data: Optional[pd.DataFrame] = None
+        
+        # Initialize cleaning statistics
+        self.stats = {
+            'rows_initial': 0,
+            'rows_final': 0,
+            'columns_initial': 0,
+            'columns_final': 0,
+            'missing_values_removed': 0,
+            'duplicates_removed': 0,
+            'outliers_removed': 0,
+            'invalid_values_corrected': 0
+        }
     
     @monitor_performance
     @handle_exceptions(DataCleaningError)
@@ -29,8 +41,14 @@ class DataCleaner:
     ) -> pd.DataFrame:
         """Clean dataset according to specified configuration."""
         try:
+            # Record initial state
+            state_monitor.record_operation_start('data_cleaning', 'data_process')
+            
             # Store original data
             self.original_data = data.copy()
+            self.stats['rows_initial'] = len(data)
+            self.stats['columns_initial'] = len(data.columns)
+            
             cleaned_data = data.copy()
             
             # Get default config if none provided
@@ -60,15 +78,21 @@ class DataCleaner:
                         len(cleaned_data)
                     )
             
-            # Store cleaned data
+            # Store cleaned data and calculate final stats
             self.cleaned_data = cleaned_data
+            self.stats['rows_final'] = len(cleaned_data)
+            self.stats['columns_final'] = len(cleaned_data.columns)
             
             # Calculate and store cleaning statistics
             self._calculate_cleaning_stats()
             
+            # Record operation completion
+            state_monitor.record_operation_end('data_cleaning', 'completed', self.stats)
+            
             return cleaned_data
             
         except Exception as e:
+            state_monitor.record_operation_end('data_cleaning', 'failed', {'error': str(e)})
             raise DataCleaningError(
                 f"Error during data cleaning: {str(e)}"
             ) from e
@@ -87,7 +111,9 @@ class DataCleaner:
         cleaned_data = data.drop_duplicates(subset=subset, keep=keep)
         removed_rows = initial_rows - len(cleaned_data)
         
+        self.stats['duplicates_removed'] += removed_rows
         logger.info(f"Removed {removed_rows} duplicate rows")
+        
         return cleaned_data
     
     @monitor_performance
@@ -100,6 +126,8 @@ class DataCleaner:
         strategy = config.get('strategy', 'remove')
         threshold = config.get('threshold', 0.5)
         fill_values = config.get('fill_values', {})
+        
+        initial_missing = data.isnull().sum().sum()
         
         if strategy == 'remove':
             # Remove columns with too many missing values
@@ -118,6 +146,9 @@ class DataCleaner:
                     data[col].fillna(data[col].mean(), inplace=True)
                 else:
                     data[col].fillna(data[col].mode().iloc[0], inplace=True)
+        
+        final_missing = data.isnull().sum().sum()
+        self.stats['missing_values_removed'] += initial_missing - final_missing
         
         return data
     
@@ -158,6 +189,8 @@ class DataCleaner:
         threshold = config.get('threshold', 3)
         columns = config.get('columns', data.select_dtypes(include=[np.number]).columns)
         
+        initial_rows = len(data)
+        
         for col in columns:
             if col in data.columns:
                 if method == 'zscore':
@@ -171,6 +204,8 @@ class DataCleaner:
                         (data[col] >= Q1 - threshold * IQR) &
                         (data[col] <= Q3 + threshold * IQR)
                     ]
+        
+        self.stats['outliers_removed'] += initial_rows - len(data)
         
         return data
     
@@ -192,6 +227,10 @@ class DataCleaner:
                     data[col] = data[col].str.strip()
                 if 'spaces' in operations:
                     data[col] = data[col].str.replace(r'\s+', ' ', regex=True)
+                if 'special_chars' in operations:
+                    data[col] = data[col].str.replace(r'[^a-zA-Z0-9\s]', '', regex=True)
+                if 'numbers' in operations:
+                    data[col] = data[col].str.replace(r'\d+', '', regex=True)
         
         return data
     
@@ -204,21 +243,28 @@ class DataCleaner:
         """Validate values based on configuration."""
         validations = config.get('validations', {})
         
+        initial_invalid = 0
         for col, rules in validations.items():
             if col in data.columns:
                 if 'range' in rules:
                     min_val, max_val = rules['range']
-                    data = data[
-                        (data[col] >= min_val) &
-                        (data[col] <= max_val)
-                    ]
+                    invalid_mask = (data[col] < min_val) | (data[col] > max_val)
+                    initial_invalid += invalid_mask.sum()
+                    data = data[~invalid_mask]
+                
                 if 'pattern' in rules:
                     pattern = rules['pattern']
-                    data = data[data[col].str.match(pattern)]
+                    invalid_mask = ~data[col].str.match(pattern)
+                    initial_invalid += invalid_mask.sum()
+                    data = data[~invalid_mask]
+                
                 if 'allowed_values' in rules:
                     allowed = set(rules['allowed_values'])
-                    data = data[data[col].isin(allowed)]
+                    invalid_mask = ~data[col].isin(allowed)
+                    initial_invalid += invalid_mask.sum()
+                    data = data[~invalid_mask]
         
+        self.stats['invalid_values_corrected'] += initial_invalid
         return data
     
     @monitor_performance
@@ -236,7 +282,10 @@ class DataCleaner:
         
         return data
     
-    def _infer_and_convert_type(self, series: pd.Series) -> pd.Series:
+    def _infer_and_convert_type(
+        self,
+        series: pd.Series
+    ) -> pd.Series:
         """Infer and convert data type for a series."""
         # Try numeric conversion
         try:
@@ -287,7 +336,7 @@ class DataCleaner:
             },
             'standardize_text': {
                 'enabled': True,
-                'operations': ['lowercase', 'strip', 'spaces'],
+                'operations': ['lowercase', 'strip', 'spaces', 'special_chars'],
                 'columns': []
             },
             'validate_values': {
@@ -340,14 +389,45 @@ class DataCleaner:
                 self.cleaned_data.isnull().sum().sum()
             ),
             'cleaning_steps': len(self.cleaning_history),
-            'cleaning_duration': sum(
-                record.get('duration', 0)
-                for record in self.cleaning_history
-            )
+            'stats': self.stats
         }
         
         # Update state
         state_manager.set_state('data.cleaning.stats', self.cleaning_stats)
+    
+    @monitor_performance
+    def get_cleaning_summary(self) -> Dict[str, Any]:
+        """Get summary of cleaning operations."""
+        return {
+            'cleaning_stats': self.cleaning_stats,
+            'steps_performed': len(self.cleaning_history),
+            'last_cleaning': self.cleaning_history[-1] if self.cleaning_history else None,
+            'total_modifications': sum(self.stats.values())
+        }
+    
+    @monitor_performance
+    def save_cleaning_report(
+        self,
+        path: Optional[Path] = None
+    ) -> None:
+        """Save cleaning report to disk."""
+        if path is None:
+            path = config.directories.base_dir / 'cleaning_reports'
+        
+        path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Save cleaning history
+        pd.DataFrame(self.cleaning_history).to_csv(
+            path / f'cleaning_history_{timestamp}.csv',
+            index=False
+        )
+        
+        # Save cleaning stats
+        with open(path / f'cleaning_stats_{timestamp}.json', 'w') as f:
+            json.dump(self.cleaning_stats, f, indent=4)
+        
+        logger.info(f"Cleaning report saved to {path}")
 
 # Create global data cleaner instance
 data_cleaner = DataCleaner()
