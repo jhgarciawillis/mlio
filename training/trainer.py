@@ -6,8 +6,9 @@ from sklearn.base import BaseEstimator
 from sklearn.model_selection import (
     train_test_split,
     cross_validate,
-    GridSearchCV,
-    RandomizedSearchCV
+    cross_val_score,
+    BaseCrossValidator,
+    KFold
 )
 from sklearn.metrics import make_scorer
 import joblib
@@ -18,15 +19,16 @@ from core.state_manager import state_manager
 from utils import logger
 from utils.decorators import monitor_performance, handle_exceptions, log_execution
 from metrics import calculator
+from clustering import clusterer
 
 class ModelTrainer:
-    """Handle model training operations."""
+    """Handle model training operations with clustering integration."""
     
     def __init__(self):
         self.models: Dict[str, BaseEstimator] = {}
         self.training_history: List[Dict[str, Any]] = []
         self.cv_results: Dict[str, Dict[str, Any]] = {}
-        self.tuning_results: Dict[str, Dict[str, Any]] = {}
+        self.cluster_models: Dict[str, Dict[str, BaseEstimator]] = {}
         self.model_metadata: Dict[str, Dict[str, Any]] = {}
         
     @monitor_performance
@@ -38,10 +40,11 @@ class ModelTrainer:
         y_train: pd.Series,
         X_val: Optional[pd.DataFrame] = None,
         y_val: Optional[pd.Series] = None,
+        cluster_labels: Optional[np.ndarray] = None,
         model_name: Optional[str] = None,
         **kwargs
     ) -> Tuple[BaseEstimator, Dict[str, Any]]:
-        """Train a model with validation."""
+        """Train model with optional clustering support."""
         try:
             if model_name is None:
                 model_name = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -54,23 +57,51 @@ class ModelTrainer:
                     random_state=config.random_state
                 )
             
-            # Train model
-            model.fit(X_train, y_train)
-            
-            # Calculate metrics
-            train_metrics = calculate_metrics(
-                y_train,
-                model.predict(X_train),
-                prefix='train'
-            )
-            val_metrics = calculate_metrics(
-                y_val,
-                model.predict(X_val),
-                prefix='val'
-            )
-            
-            # Store model
-            self.models[model_name] = model
+            if cluster_labels is not None:
+                # Train cluster-specific models
+                cluster_specific_models = self._train_cluster_models(
+                    model, X_train, y_train, cluster_labels, **kwargs
+                )
+                self.cluster_models[model_name] = cluster_specific_models
+                
+                # Train global model
+                global_model = self._train_global_model(
+                    model, X_train, y_train, cluster_labels, **kwargs
+                )
+                self.models[model_name] = global_model
+                
+                # Calculate metrics for both approaches
+                cluster_metrics = self._evaluate_cluster_models(
+                    cluster_specific_models,
+                    X_val, y_val,
+                    self._get_cluster_labels(X_val, cluster_labels)
+                )
+                
+                global_metrics = calculator.calculate_metrics(
+                    y_val,
+                    global_model.predict(X_val)
+                )
+                
+                metrics = {
+                    'cluster_specific': cluster_metrics,
+                    'global': global_metrics
+                }
+            else:
+                # Train single model
+                model.fit(X_train, y_train)
+                self.models[model_name] = model
+                
+                # Calculate metrics
+                metrics = {
+                    'train': calculator.calculate_metrics(
+                        y_train,
+                        model.predict(X_train)
+                    ),
+                    'val': calculator.calculate_metrics(
+                        y_val,
+                        model.predict(X_val)
+                    )
+                }
             
             # Create metadata
             metadata = {
@@ -78,11 +109,15 @@ class ModelTrainer:
                 'train_shape': X_train.shape,
                 'val_shape': X_val.shape,
                 'features': list(X_train.columns),
-                'train_metrics': train_metrics,
-                'val_metrics': val_metrics,
+                'metrics': metrics,
                 'parameters': model.get_params(),
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'clustering_enabled': cluster_labels is not None
             }
+            
+            if cluster_labels is not None:
+                metadata['n_clusters'] = len(np.unique(cluster_labels))
+            
             self.model_metadata[model_name] = metadata
             
             # Record training
@@ -91,9 +126,87 @@ class ModelTrainer:
             return model, metadata
             
         except Exception as e:
-            raise ModelTrainingError(
-                f"Error training model: {str(e)}"
-            ) from e
+            raise ModelTrainingError(f"Error training model: {str(e)}") from e
+    
+    def _train_cluster_models(
+        self,
+        base_model: BaseEstimator,
+        X: pd.DataFrame,
+        y: pd.Series,
+        cluster_labels: np.ndarray,
+        **kwargs
+    ) -> Dict[int, BaseEstimator]:
+        """Train separate models for each cluster."""
+        cluster_models = {}
+        unique_clusters = np.unique(cluster_labels)
+        
+        for cluster_id in unique_clusters:
+            # Get cluster data
+            mask = cluster_labels == cluster_id
+            X_cluster = X[mask]
+            y_cluster = y[mask]
+            
+            if len(X_cluster) > 0:
+                # Create and train cluster-specific model
+                model = self._clone_model(base_model)
+                model.fit(X_cluster, y_cluster, **kwargs)
+                cluster_models[cluster_id] = model
+        
+        return cluster_models
+    
+    def _train_global_model(
+        self,
+        base_model: BaseEstimator,
+        X: pd.DataFrame,
+        y: pd.Series,
+        cluster_labels: np.ndarray,
+        **kwargs
+    ) -> BaseEstimator:
+        """Train global model with cluster information."""
+        # Add cluster labels as a feature
+        X_with_clusters = X.copy()
+        X_with_clusters['cluster'] = cluster_labels
+        
+        # Train global model
+        model = self._clone_model(base_model)
+        model.fit(X_with_clusters, y, **kwargs)
+        
+        return model
+    
+    def _evaluate_cluster_models(
+        self,
+        cluster_models: Dict[int, BaseEstimator],
+        X: pd.DataFrame,
+        y: pd.Series,
+        cluster_labels: np.ndarray
+    ) -> Dict[str, Any]:
+        """Evaluate cluster-specific models."""
+        metrics = {}
+        
+        for cluster_id, model in cluster_models.items():
+            # Get cluster data
+            mask = cluster_labels == cluster_id
+            X_cluster = X[mask]
+            y_cluster = y[mask]
+            
+            if len(X_cluster) > 0:
+                # Calculate metrics for this cluster
+                predictions = model.predict(X_cluster)
+                metrics[f'cluster_{cluster_id}'] = calculator.calculate_metrics(
+                    y_cluster,
+                    predictions
+                )
+        
+        # Calculate overall metrics
+        all_predictions = np.zeros_like(y)
+        for cluster_id, model in cluster_models.items():
+            mask = cluster_labels == cluster_id
+            if np.any(mask):
+                all_predictions[mask] = model.predict(X[mask])
+        
+        metrics['overall'] = calculator.calculate_metrics(y, all_predictions)
+        
+        return metrics
     
     @monitor_performance
     def cross_validate_model(
@@ -101,11 +214,12 @@ class ModelTrainer:
         model: BaseEstimator,
         X: pd.DataFrame,
         y: pd.Series,
-        cv: int = 5,
+        cv: Union[int, BaseCrossValidator] = 5,
         scoring: Union[str, Dict[str, str], List[str]] = 'r2',
+        cluster_labels: Optional[np.ndarray] = None,
         model_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Perform cross-validation."""
+        """Perform cross-validation with optional clustering support."""
         if model_name is None:
             model_name = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
@@ -119,103 +233,128 @@ class ModelTrainer:
             if isinstance(score, str):
                 scorers[score] = make_scorer(score)
         
-        # Perform cross-validation
-        cv_results = cross_validate(
-            model,
-            X,
-            y,
-            cv=cv,
-            scoring=scorers,
-            return_train_score=True
-        )
+        if cluster_labels is not None:
+            # Perform cross-validation for each cluster
+            cluster_cv_results = {}
+            unique_clusters = np.unique(cluster_labels)
+            
+            for cluster_id in unique_clusters:
+                mask = cluster_labels == cluster_id
+                if np.sum(mask) >= cv:  # Only if enough samples
+                    cluster_model = self._clone_model(model)
+                    cv_results = cross_validate(
+                        cluster_model,
+                        X[mask],
+                        y[mask],
+                        cv=cv,
+                        scoring=scorers,
+                        return_train_score=True,
+                        n_jobs=-1
+                    )
+                    cluster_cv_results[f'cluster_{cluster_id}'] = cv_results
+            
+            # Add global model results
+            global_cv_results = cross_validate(
+                model,
+                X,
+                y,
+                cv=cv,
+                scoring=scorers,
+                return_train_score=True,
+                n_jobs=-1
+            )
+            
+            cv_results = {
+                'cluster_specific': cluster_cv_results,
+                'global': global_cv_results
+            }
+        else:
+            # Standard cross-validation
+            cv_results = cross_validate(
+                model,
+                X,
+                y,
+                cv=cv,
+                scoring=scorers,
+                return_train_score=True,
+                n_jobs=-1
+            )
         
         # Process results
-        cv_summary = {
-            'cv_scores': {
-                metric: {
-                    'mean': float(scores.mean()),
-                    'std': float(scores.std()),
-                    'scores': scores.tolist()
-                }
-                for metric, scores in cv_results.items()
-            },
-            'cv_folds': cv,
-            'scoring': scoring
-        }
+        cv_summary = self._process_cv_results(cv_results)
         
         # Store results
         self.cv_results[model_name] = cv_summary
         
         return cv_summary
     
-    @monitor_performance
-    def tune_hyperparameters(
+    def _process_cv_results(
         self,
-        model: BaseEstimator,
+        cv_results: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Process cross-validation results."""
+        if 'cluster_specific' in cv_results:
+            # Process cluster-specific results
+            processed = {
+                'cluster_specific': {},
+                'global': {}
+            }
+            
+            # Process cluster results
+            for cluster_id, results in cv_results['cluster_specific'].items():
+                processed['cluster_specific'][cluster_id] = {
+                    metric: {
+                        'mean': float(scores.mean()),
+                        'std': float(scores.std()),
+                        'scores': scores.tolist()
+                    }
+                    for metric, scores in results.items()
+                }
+            
+            # Process global results
+            global_results = cv_results['global']
+            processed['global'] = {
+                metric: {
+                    'mean': float(scores.mean()),
+                    'std': float(scores.std()),
+                    'scores': scores.tolist()
+                }
+                for metric, scores in global_results.items()
+            }
+        else:
+            # Process standard results
+            processed = {
+                metric: {
+                    'mean': float(scores.mean()),
+                    'std': float(scores.std()),
+                    'scores': scores.tolist()
+                }
+                for metric, scores in cv_results.items()
+            }
+        
+        return processed
+    
+    def _clone_model(
+        self,
+        model: BaseEstimator
+    ) -> BaseEstimator:
+        """Create a clone of the model."""
+        from sklearn.base import clone
+        return clone(model)
+    
+    def _get_cluster_labels(
+        self,
         X: pd.DataFrame,
-        y: pd.Series,
-        param_grid: Dict[str, Any],
-        method: str = 'grid',
-        cv: int = 5,
-        scoring: str = 'r2',
-        n_iter: int = 10,
-        model_name: Optional[str] = None
-    ) -> Tuple[BaseEstimator, Dict[str, Any]]:
-        """Tune model hyperparameters."""
-        if model_name is None:
-            model_name = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        # Select search method
-        if method == 'grid':
-            search = GridSearchCV(
-                model,
-                param_grid,
-                cv=cv,
-                scoring=scoring,
-                return_train_score=True,
-                n_jobs=-1
-            )
-        else:  # randomized
-            search = RandomizedSearchCV(
-                model,
-                param_grid,
-                n_iter=n_iter,
-                cv=cv,
-                scoring=scoring,
-                return_train_score=True,
-                n_jobs=-1,
-                random_state=config.random_state
-            )
-        
-        # Perform search
-        search.fit(X, y)
-        
-        # Process results
-        tuning_results = {
-            'best_params': search.best_params_,
-            'best_score': float(search.best_score_),
-            'cv_results': {
-                'params': search.cv_results_['params'],
-                'mean_test_score': search.cv_results_['mean_test_score'].tolist(),
-                'std_test_score': search.cv_results_['std_test_score'].tolist(),
-                'mean_train_score': search.cv_results_['mean_train_score'].tolist(),
-                'std_train_score': search.cv_results_['std_train_score'].tolist()
-            },
-            'method': method,
-            'cv': cv,
-            'scoring': scoring
-        }
-        
-        # Store results
-        self.tuning_results[model_name] = tuning_results
-        
-        return search.best_estimator_, tuning_results
+        train_labels: np.ndarray
+    ) -> np.ndarray:
+        """Get cluster labels for new data."""
+        return clusterer.predict_clusters(X, train_labels)
     
     @monitor_performance
     def save_model(
         self,
         model_name: str,
-        path: Optional[str] = None
+        path: Optional[Path] = None
     ) -> None:
         """Save model and its metadata."""
         if model_name not in self.models:
@@ -223,16 +362,22 @@ class ModelTrainer:
         
         if path is None:
             path = config.directories.training_models
+            path.mkdir(parents=True, exist_ok=True)
         
-        # Create directory if it doesn't exist
-        Path(path).mkdir(parents=True, exist_ok=True)
-        
-        # Save model
-        model_path = Path(path) / f"{model_name}.joblib"
+        # Save main model
+        model_path = path / f"{model_name}.joblib"
         joblib.dump(self.models[model_name], model_path)
         
+        # Save cluster models if they exist
+        if model_name in self.cluster_models:
+            cluster_path = path / f"{model_name}_clusters"
+            cluster_path.mkdir(exist_ok=True)
+            for cluster_id, model in self.cluster_models[model_name].items():
+                cluster_model_path = cluster_path / f"cluster_{cluster_id}.joblib"
+                joblib.dump(model, cluster_model_path)
+        
         # Save metadata
-        metadata_path = Path(path) / f"{model_name}_metadata.json"
+        metadata_path = path / f"{model_name}_metadata.json"
         with open(metadata_path, 'w') as f:
             json.dump(self.model_metadata[model_name], f, indent=4)
         
@@ -242,21 +387,31 @@ class ModelTrainer:
     def load_model(
         self,
         model_name: str,
-        path: Optional[str] = None
+        path: Optional[Path] = None
     ) -> BaseEstimator:
         """Load model and its metadata."""
         if path is None:
             path = config.directories.training_models
         
-        # Load model
-        model_path = Path(path) / f"{model_name}.joblib"
+        # Load main model
+        model_path = path / f"{model_name}.joblib"
         if not model_path.exists():
             raise ModelTrainingError(f"Model file not found: {model_path}")
         
         self.models[model_name] = joblib.load(model_path)
         
+        # Load cluster models if they exist
+        cluster_path = path / f"{model_name}_clusters"
+        if cluster_path.exists():
+            self.cluster_models[model_name] = {}
+            for cluster_model_path in cluster_path.glob("cluster_*.joblib"):
+                cluster_id = int(cluster_model_path.stem.split('_')[1])
+                self.cluster_models[model_name][cluster_id] = joblib.load(
+                    cluster_model_path
+                )
+        
         # Load metadata
-        metadata_path = Path(path) / f"{model_name}_metadata.json"
+        metadata_path = path / f"{model_name}_metadata.json"
         if metadata_path.exists():
             with open(metadata_path, 'r') as f:
                 self.model_metadata[model_name] = json.load(f)
